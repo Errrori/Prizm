@@ -43,6 +43,7 @@ src = ["src", "tests", "eval"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["prizm"]
@@ -50,6 +51,7 @@ known-first-party = ["prizm"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
+explicit_package_bases = true
 check_untyped_defs = true
 warn_return_any = true
 warn_unused_ignores = true
@@ -57,7 +59,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "-ra -m 'not eval'"
 markers = [
     "unit: fast, deterministic, no LLM/network",

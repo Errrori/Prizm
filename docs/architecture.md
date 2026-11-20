@@ -1,0 +1,173 @@
+# Prizm 架构说明
+
+> **格式契约（AI 必读，禁止修改本节）**
+> - 用途：记录技术栈、模块职责、模块间契约、架构决策。新会话据此理解项目结构。
+> - 写法：增量修改对应小节；"关键决策与取舍"一节**只许追加**，旧决策被推翻时标记"已被 ADR-YYY 取代"，不许删除或改写原条目。
+> - 契约以代码为准：本文件只写接口签名和指向代码的路径，禁止在这里复制大段实现；改了接口必须在同一任务内同步更新本文件。
+> - 技术栈如需变更先经我确认。
+> - 禁止修改本格式契约。
+> - 本文是**决策真相**：记录选型、理由、被否备选与不可违背的约束。
+> - 依赖/版本以 `pyproject.toml` 为**唯一权威**（机器真相），本文不重复依赖清单，只描述取舍。
+> - 需求来源：`docs/requirements.md`。
+
+## 1. 定位与指导原则
+
+对话式数据分析 Agent：上传表格 → 自然语言提问 → 得到**可信**的数据结论。
+
+核心差异化是**可信优先**，它反过来约束了架构的三个硬要求：
+
+1. **可审计**：业务用户要能看懂“怎么算出来的”，而不是一段黑箱代码。
+2. **安全**：执行用户/模型产生的逻辑时，攻击面必须尽量小。
+3. **可澄清**：体检发现的异常、模糊的问题，必须先反问，禁止擅自决策。
+
+## 2. 技术栈（调整版）
+
+在需求文档“锁定”项基础上，明确了以下调整：
+
+| 层 | 采用 | 关键调整 / 理由 |
+|---|---|---|
+| 语言 | Python 3.11+ | pandas / litellm / UI 生态绑定 |
+| 包管理 | uv（`pyproject.toml` + `uv.lock`） | 可复现、CI/Docker 友好 |
+| **执行引擎** | **DuckDB（SQL-first）+ pandas（结果/绘图/兜底变换）** | **调整**：原“生成 pandas 代码再 exec”改为 SQL 优先，见 ADR-0001 |
+| UI | **Chainlit** | **调整**：原 Streamlit 改为 Chainlit，贴合“Agent + 透明步骤时间线”，见 ADR-0002 |
+| LLM 接入 | **litellm**，包在自有 `llm/adapter` 之后 | 保留 litellm（多 provider + 成本统计），但隔离其抽象，见 ADR-0003 |
+| 数据源 | CSV / Excel（openpyxl，`.xls` 走可选 `xlrd`）/ SQLite（stdlib），`BaseConnector` 抽象 | 见 ADR-0005 |
+| 体检 profiler | 自研 pandas profiler（紧凑、可注入、可单测） | 不用 ydata-profiling/sweetviz |
+| 沙箱 | SQL 路径用 DuckDB 限额；pandas 兜底用子进程 + AST/import 白名单 + 超时；Docker 兜底隔离 | 见 ADR-0004 |
+| 检索 | **BM25 起步**；向量 + rerank 设为可选 extra | **简化**：不默认上三件套，见 ADR-0006 |
+| 图表 | matplotlib（Agg）→ PNG，输入为 **chart spec** 而非代码 | 模板化渲染，避免任意绘图代码 |
+| 配置/密钥 | pydantic-settings + `.env`；key 只读 env / 会话内存 | 不落盘、不打日志 |
+| 测试/评测 | pytest（单测/集成）+ 独立 `eval/`（统计性，默认不进 CI） | 见第 6 节 |
+| 容器 | Dockerfile（非 root、禁网、只读挂载） | 兼作沙箱真隔离 |
+
+## 3. 架构总览
+
+```mermaid
+flowchart TD
+    U[用户] -->|上传 CSV/Excel/SQLite| UI[Chainlit UI]
+    UI -->|自然语言提问| ORC[Orchestrator 状态机]
+    UI --> SESS[Session State<br/>df 缓存 / 对话 / key 仅内存]
+
+    SESS --> CONN[Connector 层<br/>BaseConnector]
+    CONN -->|注册为视图| ENG[(DuckDB 引擎)]
+    CONN --> PROF[Profiler 体检]
+
+    PROF -->|紧凑体检报告| ORC
+    ORC -->|Schema + 统计摘要 + 样本| LLM[LLM Adapter<br/>litellm]
+    ORC -->|异常未确认 / 问题模糊| CLR[Clarify 澄清门禁]
+    CLR --> UI
+
+    ORC -->|NL → SQL + chart spec| PLAN[Planner]
+    PLAN --> ENG
+    ENG -->|结果 DataFrame| VIZ[Chart Renderer<br/>matplotlib]
+    ENG -->|报错| REP[Repair ≤ 3 次]
+    REP --> LLM
+    ENG --> ANS[Answer Composer]
+    VIZ --> ANS
+    ANS --> UI
+
+    RAG[(BM25 数据字典)] -.-> ORC
+    ORC -.每一步 trace.-> TRACE[Transparency Timeline]
+    TRACE --> UI
+```
+
+## 4. 核心链路（P0）
+
+1. **接入**：Connector 把 CSV/Excel/SQLite 读取并注册为 DuckDB 视图（SQLite 用 stdlib `sqlite3`/pandas 读出后注册，避免扩展联网下载）。
+2. **体检**：Profiler 产出紧凑报告（行列/类型/缺失/分布/重复分主键/脏格式/5 行样本），作为 prompt 上下文注入。
+3. **澄清门禁**：Orchestrator 在生成前判断——体检存在未确认异常、或问题有多种解读 → 反问，不进入执行。
+4. **规划**：LLM 输出 **DuckDB SQL** + 可选 **chart spec**（类型/x/y/聚合/标题），不产出可执行 Python。
+5. **执行**：DuckDB 以只读连接执行，启用 `memory_limit` / `threads` / 超时。
+6. **自修复**：报错 → 格式化错误回传 → 重新生成 SQL，最多 3 次。
+7. **呈现**：结果 DataFrame → chart spec 渲染 PNG → Answer Composer 汇总“结论 + 图 + 依据”。
+8. **透明**：每一步写入 trace（引用了哪些体检结论、生成的 SQL、执行状态），在 Chainlit Step 中展示。
+
+> pandas 仅用于：结果整形、绘图数据准备，以及少数 SQL 无法表达的复杂变换（走受限沙箱，见 ADR-0004）。**默认路径不执行自由代码**。
+
+## 5. 关键决策与取舍（ADR 摘要）
+
+### ADR-0001 执行范式：SQL-first（DuckDB）
+- **决策**：核心分析由 LLM 生成 SQL、DuckDB 执行；不默认生成并 exec 自由 Python。
+- **理由**：SQL 可读可审计，直接服务“可信/透明”；沙箱面从“任意 Python”降为“只读查询 + 限额”，安全成本骤降；聚合/趋势确定性好、更快。
+- **被否**：① 自由 pandas exec——安全面最大、业务用户看不懂；② 纯工具 DSL / function calling——最安全但覆盖 50 个评测任务更难。
+- **代价**：复杂变换/自定义逻辑仍需兜底 Python；已用“引擎接口 + 受限沙箱”隔离。
+- **重估条件**：评测显示 SQL 无法覆盖的任务占比过高时，扩大受限 pandas 通道或引入工具 DSL。
+
+### ADR-0002 UI：Chainlit
+- **决策**：聊天与透明面板用 Chainlit，弃 Streamlit。
+- **理由**：原生 step / 流式 / 中间步骤可折叠，正好对应“过程透明时间线”；Streamlit 整脚本 rerun 模型对长链路 Agent 的实时步骤展示很别扭。
+- **被否**：Streamlit（演示快但状态/流式折腾）、Gradio（可用但步骤展示不如 Chainlit 原生）。
+- **代价**：生态/示例少于 Streamlit；需求文档中“Streamlit 侧边栏”改为 Chainlit 步骤面板（功能等价）。
+- **重估条件**：需要更复杂布局 / 多页时，评估 Gradio 或 FastAPI + 轻前端。
+
+### ADR-0003 LLM 抽象：litellm（隔离在其后）
+- **决策**：保留 litellm，但只在 `llm/adapter.py` 内使用，业务代码只依赖自有接口。
+- **理由**：多 provider（Qwen/GPT/Claude）+ streaming + 成本统计能满足“换模型只改配置”“额度上限”。
+- **被否**：裸 `openai` SDK + `base_url` 映射——更轻，但 Claude 原生非 OpenAI 兼容，多 provider 摩擦更大。
+- **代价**：依赖较重、版本迭代快；用 adapter 收敛，便于日后替换为薄适配层。
+
+### ADR-0004 沙箱与资源限制
+- **决策**：分两条路径。SQL 路径用 DuckDB `memory_limit`/`threads`/超时 + 只读连接；pandas 兜底走独立子进程 + AST/import 白名单 + 超时；生产环境用 Docker（禁网、只读、`setrlimit`）做真隔离。
+- **理由**：默认路径不执行自由代码，安全成本已大幅下降；兜底路径仍守住“禁网禁写 + 资源上限”。
+- **代价**：Windows 下 `setrlimit` 不可用，开发期资源限制为尽力而为；在 README 注明以容器为准。
+
+### ADR-0005 Connector 契约（先定引擎，再定接口）
+- **决策**：`BaseConnector` 约定返回“可注册到 DuckDB 的数据源”，而非单纯 DataFrame。
+- **理由**：先把引擎定死为 DuckDB，Connector 才能与之对齐；SQLite 通过 stdlib 读出后注册，避免运行时扩展联网。
+- **扩展**：新增数据源继承 `BaseConnector`，只需实现“产出关系 / 注册视图”。
+
+### ADR-0006 检索：BM25 起步，向量/rerank 可选
+- **决策**：默认只上 BM25 + 原文出处；向量与 rerank 放 `vector` extra，按评测再启用。
+- **理由**：数据字典语料小，混合检索 + rerank 对小语料增益有限却带来延迟/依赖；第 7 节指标是“引用溯源准确率”，更依赖返回带出处的原文片段。
+- **代价**：极端同义/口语化查询召回可能不足；用评测数据决定是否启用向量。
+- **重估条件**：术语 QA 召回不达标时启用 `vector`。
+
+## 6. 不变量（不可违背）
+
+- **密钥**：仅来自环境变量或会话输入，只存内存；不落盘、不打日志、不进仓库。
+- **执行**：默认无自由代码执行；SQL 只读 + 限额；pandas 兜底必须过白名单与超时。
+- **评测与单测分离**：`unit`/`integration` 确定性、可 mock LLM、进 CI；`eval` 统计性、慢、默认排除（`-m 'not eval'`）。
+- **单一事实源**：依赖/版本只在 `pyproject.toml`；本文只记为什么。
+- **数据不重复加载**：会话内 df/关系缓存一次，多轮复用。
+
+## 7. 与需求 / 指标映射
+
+| 需求 | 承载模块 |
+|---|---|
+| P0 数据体检 | `profiling/`（自研，埋雷集检出率 100% 由单测保障） |
+| P0 对话式分析 | `agent/orchestrator` + `agent/planner` + `engine/duckdb` |
+| P0 澄清机制 | `agent/clarify`（该问就问 / 不该问不问） |
+| P1 自修复 | `agent/repair`（≤3 次） |
+| P1 多轮上下文 | `agent/memory` + 会话缓存 |
+| P1 RAG 字典问答 | `rag/`（BM25 起步） |
+| P2 透明面板 | trace + Chainlit Step |
+| 第 7 节指标 | `eval/`（成功率 / 检出率 / 澄清正确率 / RAG） |
+
+## 8. 目录结构
+
+```
+Prizm/
+├─ pyproject.toml            # 机器真相：依赖 / 版本 / 工具配置
+├─ Dockerfile                # 非 root + 禁网 + 只读（兼沙箱隔离）
+├─ README.md                 # 架构图 + 演示 GIF + 评测结果
+├─ .env.example              # 模型 / 额度配置，不含真实 key
+├─ docs/
+│  ├─ Architecture.md        # 本文件：决策真相
+│  └─ requirements.md        # 需求定义
+├─ app/
+│  └─ main.py                # Chainlit 入口
+├─ src/prizm/
+│  ├─ config.py              # pydantic-settings
+│  ├─ llm/adapter.py         # litellm 封装（stream / retry / 额度）
+│  ├─ datasource/            # base / csv / excel / sqlite connector
+│  ├─ engine/duckdb_engine.py# SQL 执行 + 限额
+│  ├─ profiling/             # profiler / checks / models
+│  ├─ agent/                 # orchestrator / clarify / planner / repair / memory / prompts
+│  ├─ sandbox/               # policy / executor / runner（pandas 兜底）
+│  ├─ rag/                   # index / retriever / ingest
+│  ├─ viz/charts.py          # chart spec → matplotlib PNG
+│  └─ utils/                 # logging / tokens（额度）
+├─ tests/{unit,integration,fixtures}
+├─ eval/{datasets,run_eval.py,metrics.py}
+└─ scripts/gen_data_dict.py
+```

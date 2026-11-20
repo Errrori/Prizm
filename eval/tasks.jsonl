@@ -1,0 +1,10 @@
+{"id":"clean-001","category":"cleaning","dataset":"orders.csv","question":"这份订单数据里是否存在完全重复的行？如果存在，返回重复行数。","expected":0,"expects_clarification":false}
+{"id":"clean-002","category":"aggregation","dataset":"orders.csv","question":"统计 2026 年第一季度状态为“已完成”的订单销售额总额。","expected":11200,"expects_clarification":false}
+{"id":"clean-003","category":"aggregation","dataset":"orders.csv","question":"按渠道统计状态为“已完成”的订单销售额，并按销售额从高到低排序。","expected":[{"channel":"分销","sales":4600},{"channel":"线上","sales":3800},{"channel":"线下","sales":2800}],"expects_clarification":false}
+{"id":"clean-004","category":"trend","dataset":"orders.csv","question":"按月份统计状态为“已完成”的订单销售额趋势。","expected":[{"month":"2026-01","sales":2700},{"month":"2026-02","sales":2900},{"month":"2026-03","sales":5600}],"expects_clarification":false}
+{"id":"clean-005","category":"trend","dataset":"orders.csv","question":"哪个月的已完成订单销售额最高？只返回月份。","expected":"2026-03","expects_clarification":false}
+{"id":"clean-006","category":"attribution","dataset":"orders.csv","question":"哪个渠道对已完成订单销售额贡献最大？只返回渠道名称。","expected":"分销","expects_clarification":false}
+{"id":"clean-007","category":"multi_turn","dataset":"orders.csv","question":"承接上一题的筛选条件，只看已完成订单，按产品统计销售额，并从高到低排序。","expected":[{"product":"旗舰版","sales":4800},{"product":"专业版","sales":3600},{"product":"基础版","sales":2800}],"expects_clarification":false}
+{"id":"dirty-001","category":"cleaning","dataset":"orders_dirty.csv","question":"检测到完全重复行，也有同一订单号对应不同金额的记录。统计销售额前是否应该去重？按哪种去重口径？","expected":null,"expects_clarification":true}
+{"id":"dirty-002","category":"cleaning","dataset":"orders_dirty.csv","question":"sales 列混入了千分位格式，应该先清洗为数值再统计，还是按原样处理？","expected":null,"expects_clarification":true}
+{"id":"dirty-003","category":"cleaning","dataset":"orders_dirty.csv","question":"quantity 存在缺失值，这些订单应该剔除、按 0 处理，还是先确认原始数据？","expected":null,"expects_clarification":true}

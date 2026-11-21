@@ -104,4 +104,4 @@ class Planner:
             frame,
             sample_rows=self.sample_rows,
         )
-        return parse_plan(self.llm.complete(messages))
+        return parse_plan(self.llm.complete(messages).text)

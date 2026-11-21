@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from prizm.config import PROVIDER_KEY_ENV, Settings
+from prizm.utils.tokens import Completion, DailyUsageLedger, Usage
 
 Message = dict[str, str]
 CompletionFn = Callable[..., Any]
@@ -25,7 +26,7 @@ class LLMConfigError(LLMError):
 
 
 class LLMAdapter(Protocol):
-    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> str: ...
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion: ...
 
 
 @dataclass
@@ -35,9 +36,45 @@ class MockLLM:
     response: str = '{"sql": "SELECT 1 AS ok", "chart": null}'
     calls: list[list[Message]] = field(default_factory=list)
 
-    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> str:
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
         self.calls.append([dict(message) for message in messages])
-        return self.response
+        return Completion(self.response)
+
+
+def _read_field(source: Any, name: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        return source.get(name)
+    return getattr(source, name, None)
+
+
+def _as_token_count(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float) and value >= 0:
+        return int(value)
+    return 0
+
+
+def extract_usage(response: Any) -> Usage:
+    """从 litellm 响应中提取 token 与费用；缺失字段按 0 处理。"""
+    raw_usage = _read_field(response, "usage")
+    # DEBT-006: 费用依赖 litellm 响应的 _hidden_params.response_cost, 缺失时无法统计。
+    cost = _read_field(_read_field(response, "_hidden_params"), "response_cost")
+    cost_usd = (
+        float(cost)
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool)
+        else None
+    )
+    return Usage(
+        prompt_tokens=_as_token_count(_read_field(raw_usage, "prompt_tokens")),
+        completion_tokens=_as_token_count(_read_field(raw_usage, "completion_tokens")),
+        total_tokens=_as_token_count(_read_field(raw_usage, "total_tokens")),
+        cost_usd=cost_usd,
+    )
 
 
 @dataclass
@@ -48,6 +85,12 @@ class LiteLLMAdapter:
     api_key: str | None = None
     api_base: str | None = None
     completion_fn: CompletionFn | None = None
+    ledger: DailyUsageLedger | None = None
+    daily_token_budget: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.daily_token_budget is not None and self.daily_token_budget < 0:
+            raise ValueError("daily_token_budget 不能为负数")
 
     def _completion(self) -> CompletionFn:
         if self.completion_fn is not None:
@@ -57,8 +100,10 @@ class LiteLLMAdapter:
 
         return cast(CompletionFn, completion)
 
-    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> str:
-        # DEBT-002: 未统计 token/费用, 也未执行每日额度与会话次数上限。
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        if self.ledger is not None and self.daily_token_budget is not None:
+            self.ledger.ensure_available(self.daily_token_budget)
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
@@ -73,20 +118,30 @@ class LiteLLMAdapter:
         except Exception as exc:
             raise LLMError(f"LLM 调用失败: {exc}") from exc
 
+        usage = extract_usage(response)
+        if self.ledger is not None:
+            self.ledger.record(usage)
+
         try:
             content = response.choices[0].message.content
         except (AttributeError, IndexError, KeyError, TypeError) as exc:
             raise LLMError("LLM 返回结构非法") from exc
         if not isinstance(content, str) or not content.strip():
             raise LLMError("LLM 返回内容为空")
-        return content
+        return Completion(content, usage)
 
 
-def build_llm(settings: Settings, *, response: str | None = None) -> LLMAdapter:
+def build_llm(
+    settings: Settings,
+    *,
+    response: str | None = None,
+    ledger: DailyUsageLedger | None = None,
+    daily_token_budget: int | None = None,
+) -> LLMAdapter:
     """按配置构建适配器；mock 模式不触网。
 
     真实模型要求当前 provider 的 key 已配置，且 api_base 显式由配置传入，
-    避免依赖 litellm 隐式读取 .env。
+    避免依赖 litellm 隐式读取 .env。传入 ledger 时按每日额度记账。
     """
     if settings.is_mock:
         return MockLLM() if response is None else MockLLM(response)
@@ -98,4 +153,11 @@ def build_llm(settings: Settings, *, response: str | None = None) -> LLMAdapter:
         raise LLMConfigError(
             f"模型 {settings.default_model} 属于 {provider}，需要环境变量 {env_name}，当前未配置"
         )
-    return LiteLLMAdapter(settings.default_model, api_key=api_key, api_base=settings.llm_api_base)
+    budget = daily_token_budget if daily_token_budget is not None else settings.daily_token_budget
+    return LiteLLMAdapter(
+        settings.default_model,
+        api_key=api_key,
+        api_base=settings.llm_api_base,
+        ledger=ledger,
+        daily_token_budget=budget if ledger is not None else None,
+    )

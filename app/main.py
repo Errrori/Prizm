@@ -14,6 +14,9 @@ from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMError, build_llm
+from prizm.utils.tokens import DailyUsageLedger, QuotaExceededError, SessionTurnCounter
+
+_usage_ledger = DailyUsageLedger()
 
 
 @cl.on_chat_start
@@ -48,9 +51,11 @@ async def on_chat_start() -> None:
     llm = build_llm(
         settings,
         response=build_mock_plan_response(connector.view_name) if settings.is_mock else None,
+        ledger=_usage_ledger,
     )
     orchestrator = Orchestrator(connector, engine, Planner(llm))
     cl.user_session.set("orchestrator", orchestrator)
+    cl.user_session.set("turns", SessionTurnCounter(settings.session_turn_limit))
 
     frame = orchestrator.dataframe
     mode = "mock（未配置真实模型）" if settings.is_mock else settings.default_model
@@ -69,11 +74,30 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content="请先上传 CSV 文件。").send()
         return
 
+    settings = get_settings()
+    turns: SessionTurnCounter | None = cl.user_session.get("turns")
+    if turns is None:
+        turns = SessionTurnCounter(settings.session_turn_limit)
+        cl.user_session.set("turns", turns)
+    if not turns.try_consume():
+        await cl.Message(
+            content=(
+                f"本会话提问次数已达上限（{turns.limit} 次），"
+                "请开启新会话后再试。"
+            )
+        ).send()
+        return
+
     try:
         async with cl.Step(name="规划与执行", type="tool") as step:
             step.input = message.content
             answer = orchestrator.ask(message.content)
             step.output = answer.sql
+    except QuotaExceededError:
+        await cl.Message(
+            content="今日模型额度已用完，请明天再试，或改用你自己的 API key。"
+        ).send()
+        return
     except (LLMError, QueryTimeoutError, ValueError, duckdb.Error) as exc:
         await cl.Message(content=f"分析失败：{exc}").send()
         return

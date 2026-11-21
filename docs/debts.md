@@ -38,13 +38,13 @@
 - 还清记录：—
 
 ### DEBT-002 LLM 额度与调用统计未实现
-- 状态：未还
+- 状态：已还清
 - 现状：`LiteLLMAdapter` 只做单次 completion，未统计 token/费用，未执行每日额度与会话次数上限。
 - 为什么简化：阶段 1 默认走 mock，不产生真实调用。
 - 触发条件：首次接入真实模型 key 联调前。
 - 涉及文件：src/prizm/config.py, src/prizm/llm/adapter.py
 - 登记日期：2026-11-21
-- 还清记录：—
+- 还清记录：2026-11-21 任务 2-0：新增 utils/tokens.py（Usage/Completion/DailyUsageLedger/SessionTurnCounter），adapter 返回 usage 并按日额度拦截，Chainlit 增加会话次数上限与友好提示；commit 见本任务 git log。
 
 ### DEBT-003 CSV 编码采用启发式回退
 - 状态：未还
@@ -61,5 +61,23 @@
 - 为什么简化：阶段 1 为单机开发运行，显式传参已覆盖主路径。
 - 触发条件：容器化部署，或多环境（dev/prod 共用进程环境 / CWD 不固定）部署前。
 - 涉及文件：src/prizm/llm/adapter.py, src/prizm/config.py
+- 登记日期：2026-11-21
+- 还清记录：—
+
+### DEBT-005 每日额度台账仅存进程内存
+- 状态：未还
+- 现状：`DailyUsageLedger` 只保存在当前进程内，进程重启或部署多副本时每日 token 用量会归零/不共享。
+- 为什么简化：当前为单机 demo，单进程即可满足每日额度限制。
+- 触发条件：在线 demo 部署，或多进程/多副本运行前。
+- 涉及文件：src/prizm/utils/tokens.py, app/main.py
+- 登记日期：2026-11-21
+- 还清记录：—
+
+### DEBT-006 费用统计依赖 litellm 响应内部字段
+- 状态：未还
+- 现状：费用从 `response._hidden_params.response_cost` 读取，provider/版本不提供该字段时只累计 token、`cost_usd` 为 None。
+- 为什么简化：不引入独立价格表，先复用 litellm 自带成本信息。
+- 触发条件：需要在界面展示费用，或按费用而非 token 做额度控制前。
+- 涉及文件：src/prizm/llm/adapter.py
 - 登记日期：2026-11-21
 - 还清记录：—

@@ -11,18 +11,25 @@ import duckdb
 import pandas as pd
 
 _MEMORY_LIMIT_RE = re.compile(r"\d+(?:\.\d+)?\s*(?:B|[KMGT]i?B)", re.IGNORECASE)
+_FIRST_TOKEN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_$]*)")
 
+# DuckDB 允许 WITH CTE 中出现 INSERT/UPDATE/DELETE/COPY, 顶层语句类型仍是 SELECT,
+# 因此除语句类型白名单外, 还要在词法层拦截可能写入的关键字。
 _FORBIDDEN_KEYWORDS = frozenset(
     {
         "alter",
+        "analyze",
         "attach",
+        "begin",
         "call",
         "checkpoint",
+        "commit",
         "copy",
         "create",
         "delete",
         "detach",
         "drop",
+        "execute",
         "export",
         "grant",
         "import",
@@ -31,7 +38,9 @@ _FORBIDDEN_KEYWORDS = frozenset(
         "load",
         "merge",
         "pragma",
+        "prepare",
         "revoke",
+        "rollback",
         "set",
         "truncate",
         "update",
@@ -39,25 +48,67 @@ _FORBIDDEN_KEYWORDS = frozenset(
     }
 )
 
-# 即使 enable_external_access=false, 也显式拦截可能触碰文件/网络的表函数。
+# 即使 enable_external_access=false, 也显式拦截可能触碰文件/网络/动态 SQL 的表函数。
+# DEBT-012: 危险函数仍按名单拦截, 升级 DuckDB 或发现新绕过时需同步。
 _FORBIDDEN_FUNCTIONS = frozenset(
     {
+        "arrow_scan",
+        "arrow_scan_dumb",
+        "checkpoint",
+        "create_external_resource",
         "delta_scan",
+        "destroy_external_resource",
+        "disable_logging",
+        "disable_profiling",
+        "enable_logging",
+        "enable_profiling",
+        "force_checkpoint",
         "glob",
         "httpfs",
         "iceberg_scan",
+        "json_execute_serialized_sql",
         "mysql_scan",
+        "parquet_bloom_probe",
+        "parquet_file_metadata",
+        "parquet_full_metadata",
+        "parquet_kv_metadata",
+        "parquet_metadata",
         "parquet_scan",
+        "parquet_schema",
         "postgres_scan",
+        "pandas_scan",
+        "python_arrow_scan",
+        "python_map_function",
+        "query",
+        "query_table",
+        "read_blob",
         "read_csv",
         "read_csv_auto",
+        "read_duckdb",
         "read_json",
         "read_json_auto",
         "read_ndjson",
         "read_ndjson_auto",
         "read_parquet",
+        "read_single_csv_file",
+        "read_single_json_file",
+        "read_single_parquet_file",
+        "read_text",
+        "register_external_resource",
+        "register_external_resource_type",
+        "sniff_csv",
         "sqlite_scan",
+        "truncate_duckdb_logs",
     }
+)
+
+_FORBIDDEN_KEYWORD_RE = re.compile(
+    r"(?:^|\()\s*(?P<keyword>" + "|".join(sorted(map(re.escape, _FORBIDDEN_KEYWORDS))) + r")\b",
+    re.IGNORECASE,
+)
+_FORBIDDEN_FUNCTION_RE = re.compile(
+    r"\b(?P<function>" + "|".join(sorted(map(re.escape, _FORBIDDEN_FUNCTIONS))) + r")\s*\(",
+    re.IGNORECASE,
 )
 
 
@@ -73,27 +124,112 @@ def quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def ensure_read_only_sql(sql: str) -> str:
-    """校验只允许单条 SELECT / WITH 查询，返回去掉尾部分号的 SQL。"""
+def _strip_noncode(sql: str) -> str:
+    """把注释、字符串和引号标识符替换为占位符, 只保留 SQL 词法骨架。
+
+    这样关键字/函数扫描不会被字符串或注释里的内容误伤, 也不会漏掉
+    ``WITH x AS (DELETE ...)`` 这类藏在 CTE 里的写操作。
+    """
+    out: list[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        next_char = sql[index + 1] if index + 1 < length else ""
+
+        if char == "-" and next_char == "-":
+            index += 2
+            while index < length and sql[index] not in "\r\n":
+                index += 1
+            out.append(" ")
+            continue
+
+        if char == "/" and next_char == "*":
+            depth = 1
+            index += 2
+            while index < length and depth > 0:
+                if sql.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif sql.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            out.append(" ")
+            continue
+
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            while index < length:
+                if sql[index] == quote:
+                    if index + 1 < length and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            out.append("''" if quote == "'" else '""')
+            continue
+
+        if char == "$":
+            tag_end = index + 1
+            while tag_end < length and (sql[tag_end].isalnum() or sql[tag_end] == "_"):
+                tag_end += 1
+            if tag_end < length and sql[tag_end] == "$":
+                tag = sql[index : tag_end + 1]
+                close = sql.find(tag, tag_end + 1)
+                if close != -1:
+                    index = close + len(tag)
+                    out.append("''")
+                    continue
+
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _strip_trailing_semicolons(sql: str) -> str:
     cleaned = sql.strip()
-    if cleaned.endswith(";"):
+    while cleaned.endswith(";"):
         cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
+def ensure_read_only_sql(sql: str) -> str:
+    """校验只允许单条 SELECT / WITH 查询，返回去掉尾部分号的 SQL。
+
+    DEBT-001: 用 DuckDB parser 做语句类型白名单, 再对去字符串/注释后的
+    词法骨架拦截 CTE 内的写操作和危险表函数; 仍非完整 AST 解析(见 DEBT-012)。
+    """
+    cleaned = sql.strip()
     if not cleaned:
         raise SQLValidationError("SQL 不能为空")
-    if ";" in cleaned:
-        raise SQLValidationError("只允许执行单条 SQL 语句")
 
-    lowered = cleaned.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
+    try:
+        statements = duckdb.extract_statements(cleaned)
+    except duckdb.Error as exc:
+        raise SQLValidationError(f"SQL 解析失败: {exc}") from exc
+    if len(statements) != 1:
+        raise SQLValidationError("只允许执行单条 SQL 语句")
+    if statements[0].type != duckdb.StatementType.SELECT:
+        raise SQLValidationError(
+            f"只允许 SELECT / WITH 查询，当前语句类型: {statements[0].type}"
+        )
+
+    stripped = _strip_noncode(cleaned)
+    first_token = _FIRST_TOKEN_RE.match(stripped)
+    if first_token is None or first_token.group(1).lower() not in {"select", "with"}:
         raise SQLValidationError("只允许 SELECT / WITH 查询")
 
-    for keyword in _FORBIDDEN_KEYWORDS:
-        if re.search(rf"\b{keyword}\b", lowered):
-            raise SQLValidationError(f"禁止的 SQL 关键字: {keyword.upper()}")
-    for function in _FORBIDDEN_FUNCTIONS:
-        if re.search(rf"\b{function}\s*\(", lowered):
-            raise SQLValidationError(f"禁止的 SQL 函数: {function}")
-    return cleaned
+    keyword = _FORBIDDEN_KEYWORD_RE.search(stripped)
+    if keyword is not None:
+        raise SQLValidationError(f"禁止的 SQL 关键字: {keyword.group('keyword').upper()}")
+    function = _FORBIDDEN_FUNCTION_RE.search(stripped)
+    if function is not None:
+        raise SQLValidationError(f"禁止的 SQL 函数: {function.group('function')}")
+    return _strip_trailing_semicolons(cleaned)
 
 
 class DuckDBEngine:
@@ -131,7 +267,7 @@ class DuckDBEngine:
 
     def execute(self, sql: str, *, max_rows: int | None = None) -> pd.DataFrame:
         cleaned = ensure_read_only_sql(sql)
-        # DEBT-001: 只读校验基于关键字/函数黑名单, 未做 SQL AST 解析。
+        # DEBT-012: 只读校验仍非完整 AST, 危险函数按名单拦截。
         timer: threading.Timer | None = None
         if self._timeout_seconds > 0:
             timer = threading.Timer(self._timeout_seconds, self._conn.interrupt)

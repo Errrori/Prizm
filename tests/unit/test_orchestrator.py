@@ -1,4 +1,6 @@
 import json
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +15,7 @@ from prizm.agent.orchestrator import (
 from prizm.agent.planner import Planner
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
-from prizm.llm.adapter import MockLLM
+from prizm.llm.adapter import Completion, Message, MockLLM
 
 
 class CountingConnector(CsvConnector):
@@ -47,6 +49,18 @@ def write_dirty_orders(path: Path) -> None:
     ).to_csv(path, index=False, encoding="utf-8")
 
 
+@dataclass
+class SequenceLLM:
+    responses: list[str]
+    calls: list[list[Message]] = field(default_factory=list)
+
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        self.calls.append([dict(message) for message in messages])
+        if not self.responses:
+            raise AssertionError("没有更多脚本化响应")
+        return Completion(self.responses.pop(0))
+
+
 def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "orders.csv"
     write_orders(path)
@@ -70,6 +84,32 @@ def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     assert answer.question == "已完成订单的销售额是多少？"
     assert answer.empty is False
     assert llm.calls
+
+
+def test_orchestrator_repairs_after_sql_error(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    bad_sql = "SELECT missing_column FROM orders"
+    good_sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    llm = SequenceLLM(
+        [
+            json.dumps({"sql": bad_sql, "chart": None}),
+            json.dumps({"sql": good_sql, "chart": None}),
+        ]
+    )
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        answer = orchestrator.ask("已完成订单的销售额是多少？")
+
+    assert isinstance(answer, Answer)
+    assert answer.attempts == 2
+    assert answer.repaired is True
+    assert len(answer.repair_history) == 1
+    assert answer.repair_history[0].sql == bad_sql
+    assert "missing_column" in answer.repair_history[0].error
+    assert int(answer.dataframe.loc[0, "total"]) == 300
+    assert "上一次尝试失败" in llm.calls[1][1]["content"]
 
 
 def test_orchestrator_builds_profile_and_injects_summary(tmp_path: Path) -> None:

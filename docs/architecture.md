@@ -78,7 +78,7 @@ flowchart TD
 3. **澄清门禁**：Orchestrator 在生成前判断——体检存在未确认异常、或问题有多种解读 → 反问，不进入执行。
 4. **规划**：LLM 输出 **DuckDB SQL** + 可选 **chart spec**（类型/x/y/聚合/标题），不产出可执行 Python。
 5. **执行**：DuckDB 以只读连接执行，启用 `memory_limit` / `threads` / 超时。
-6. **自修复**：报错 → 格式化错误回传 → 重新生成 SQL，最多 3 次。
+6. **自修复**：报错 → 格式化错误回传 → 重新生成 SQL，总尝试最多 3 次（含首次，首次失败后最多再修复 2 次）。
 7. **呈现**：结果 DataFrame → chart spec 渲染 PNG → Answer Composer 汇总“结论 + 图 + 依据”。
 8. **透明**：每一步写入 trace（引用了哪些体检结论、生成的 SQL、执行状态），在 Chainlit Step 中展示。
 
@@ -172,15 +172,16 @@ Prizm/
 └─ scripts/gen_data_dict.py
 ```
 
-## 9. 已落地接口（阶段 1 / P0 体检）
+## 9. 已落地接口（阶段 1 / P0 体检 / P1 自修复）
 
 - `prizm.datasource.base.BaseConnector`：`load() -> pd.DataFrame`（会话内缓存一次）、`view_name: str`、`register(engine)`；新增数据源继承并实现 `_read()`。CSV 实现在 `datasource/csv_connector.py`，视图名由 `sanitize_view_name` 清洗。
-- `prizm.engine.duckdb_engine.DuckDBEngine`：`register_dataframe(name, df)`、`execute(sql, max_rows=None) -> pd.DataFrame`、`close()`；构造参数 `memory_limit / threads / timeout_seconds`，内部执行只读校验并设 `enable_external_access=false`。
+- `prizm.engine.duckdb_engine.DuckDBEngine`：`register_dataframe(name, df)`、`execute(sql, max_rows=None) -> pd.DataFrame`、`close()`；构造参数 `memory_limit / threads / timeout_seconds`，内部执行只读校验并设 `enable_external_access=false`。`ensure_read_only_sql` 先由 DuckDB parser 判定为单条 `StatementType.SELECT`，再对去字符串/注释后的词法骨架拦截 CTE 内写操作与危险表函数。
 - `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> Completion(text, usage)`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings, *, response=None, ledger=None, daily_token_budget=None)` 按模型配置切换。真实模型按模型名判定 provider（qwen→dashscope / claude→anthropic / 其余→openai），只取对应 provider 的 key，缺 key 抛 `LLMConfigError`；`PRIZM_LLM_API_BASE` 显式作为 `api_base` 传给 litellm，不依赖其隐式读 `.env`。传入 `ledger` 时每次调用前检查额度、调用后记录 token/费用。
 - `prizm.utils.tokens`：`Usage(prompt_tokens, completion_tokens, total_tokens, cost_usd)`、`Completion(text, usage)`、`DailyUsageLedger`（按自然日累计，跨日清零，线程安全）、`SessionTurnCounter`（单会话次数限制，0 表示不限）、`QuotaExceededError`。
 - `prizm.agent.clarify`：`ClarifyGate.judge(question, profile) -> ClarifyDecision(requests)` 在规划前判定是否反问；异常按类型分组（完全重复/主键重复/缺失/脏数值），仅当问题命中受影响列或聚合类词时才问；`confirm(code, choice, question=None)` 记录会话级口径，`policy_summary()` 供 planner 注入；问题模糊时可用 `LLMAmbiguityJudge` 按 JSON 判定，判定失败回退关键词启发式；`parse_ambiguity_response` 负责校验模型输出。
-- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；`parse_plan` 校验 JSON 并解析可选 chart。
-- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None).ask(question) -> Answer | Clarification`；构造时自动体检一次，`profile` 属性暴露 `ProfileReport`；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后重跑原问题并注入口径；`format_result_table` 负责文本展示。
+- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, repair_feedback=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；有修复反馈时追加“上一次尝试失败，需要修复”段；`parse_plan` 校验 JSON 并解析可选 chart。
+- `prizm.agent.repair.Repairer(planner, engine, max_attempts=3).run(question, view_name, frame, *, profile_summary=None, confirmed_policies=None) -> RepairResult(plan, dataframe, attempts, history)`：总尝试不超过 3 次（含首次）；解析/校验/执行/超时错误回传错误类型与消息并重新规划，LLM 调用失败与额度超限不重试；耗尽抛 `RepairFailed(question, attempts, last_error)`。`format_repair_error` 不回传本机 traceback。
+- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None, repairer=None).ask(question) -> Answer | Clarification`；构造时自动体检一次，`profile` 属性暴露 `ProfileReport`；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后重跑原问题并注入口径；执行经 `Repairer`，`Answer` 暴露 `attempts / repaired / repair_history`；`format_result_table` 负责文本展示。
 - `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
-- 入口 `app/main.py`：Chainlit 上传 CSV → 注册 DuckDB → 生成并展示体检报告 → 提问 → 展示 SQL + 结果；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。
+- 入口 `app/main.py`：Chainlit 上传 CSV → 注册 DuckDB → 生成并展示体检报告 → 提问 → 展示 SQL + 结果；自修复成功时在 Step 展示尝试次数与修复记录，`RepairFailed` 时展示最终错误；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。

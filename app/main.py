@@ -15,6 +15,7 @@ from prizm.agent.orchestrator import (
     format_result_table,
 )
 from prizm.agent.planner import Planner, build_mock_plan_response
+from prizm.agent.repair import RepairFailed
 from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
@@ -129,6 +130,14 @@ async def on_message(message: cl.Message) -> None:
     except QuotaExceededError:
         await cl.Message(content="今日模型额度已用完，请明天再试，或改用你自己的 API key。").send()
         return
+    except RepairFailed as exc:
+        await cl.Message(
+            content=(
+                f"分析失败：已尝试 {exc.attempts} 次仍无法执行。\n"
+                f"最后错误：{exc.last_error}"
+            )
+        ).send()
+        return
     except (LLMError, QueryTimeoutError, ValueError, RuntimeError, duckdb.Error) as exc:
         await cl.Message(content=f"分析失败：{exc}").send()
         return
@@ -147,7 +156,15 @@ async def on_message(message: cl.Message) -> None:
 def _step_output(result: Answer | Clarification) -> str:
     if isinstance(result, Clarification):
         return result.request.question
-    return result.sql
+    output = result.sql
+    if result.repaired:
+        output += f"\n（第 {result.attempts} 次尝试成功）"
+        if result.repair_history:
+            history = "\n".join(
+                f"- 第 {item.attempt} 次：{item.error}" for item in result.repair_history
+            )
+            output += f"\n修复记录：\n{history}"
+    return output
 
 
 def _selected_value(response: Any) -> str | None:

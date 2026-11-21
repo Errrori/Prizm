@@ -65,6 +65,34 @@ def test_planner_passes_profile_summary_to_llm() -> None:
     assert "数据体检：2 行 × 1 列" in llm.calls[0][1]["content"]
 
 
+def test_prompt_injects_repair_feedback() -> None:
+    frame = pd.DataFrame({"sales": [1, 2]})
+    feedback = "第 1 次尝试失败。\n错误：BinderException: missing"
+
+    messages = build_plan_prompt(
+        "销售额",
+        "orders",
+        frame,
+        profile_summary="数据体检：2 行 × 1 列",
+        repair_feedback=feedback,
+    )
+    user_content = messages[1]["content"]
+
+    assert "上一次尝试失败，需要修复" in user_content
+    assert feedback in user_content
+    assert "数据体检：2 行 × 1 列" in user_content
+
+
+def test_planner_passes_repair_feedback_to_llm() -> None:
+    frame = pd.DataFrame({"sales": [1, 2]})
+    llm = MockLLM(json.dumps({"sql": "SELECT 1", "chart": None}))
+    planner = Planner(llm)
+
+    planner.plan("销售额", "orders", frame, repair_feedback="上次 SQL 缺列")
+
+    assert "上次 SQL 缺列" in llm.calls[0][1]["content"]
+
+
 def test_parse_plan_accepts_fenced_json() -> None:
     text = '```json\n{"sql": "SELECT 1", "chart": null}\n```'
 

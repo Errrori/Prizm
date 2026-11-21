@@ -29,13 +29,13 @@
 ## 台账
 
 ### DEBT-001 SQL 只读校验基于关键字黑名单
-- 状态：未还
+- 状态：已还清
 - 现状：`ensure_read_only_sql` 用 SELECT/WITH 前缀 + 关键字/函数黑名单拦截，未做 SQL AST 解析。
 - 为什么简化：阶段 1 只需跑通链路；DuckDB 已设 `enable_external_access=false`，黑名单作为第二道防线。
 - 触发条件：接入自修复（repair）前必须复核。
 - 涉及文件：src/prizm/engine/duckdb_engine.py
 - 登记日期：2026-11-21
-- 还清记录：—
+- 还清记录：2026-11-21 任务 3-1：改为 DuckDB parser 语句类型白名单（仅单条 SELECT；拒绝 CTE 内 INSERT/UPDATE/DELETE/COPY），并对去字符串/注释后的词法骨架做关键字与危险函数拦截；外部访问仍关闭。commit 见本任务 git log。
 
 ### DEBT-002 LLM 额度与调用统计未实现
 - 状态：已还清
@@ -124,6 +124,15 @@
 - 为什么简化：避免模型抖动或临时故障阻断用户提问。
 - 触发条件：接入真实模型后发现模糊判定漏报时。
 - 涉及文件：src/prizm/agent/clarify.py
+- 登记日期：2026-11-21
+- 还清记录：—
+
+### DEBT-012 只读校验仍非完整 AST，危险函数依赖名单
+- 状态：未还
+- 现状：`ensure_read_only_sql` 用 DuckDB parser 判定语句类型，再对去字符串/注释后的词法骨架做关键字与危险表函数名单校验；CTE 内写操作、动态 SQL/文件函数已拦截，但无法覆盖未来 DuckDB 新函数或复杂语法绕过，且未加引号的保留字标识符可能被误杀。
+- 为什么简化：当前不引入额外 SQL AST 依赖，先保证自修复前的执行面可控。
+- 触发条件：升级 DuckDB 版本、评测出现只读校验绕过或误杀、接入不可信用户数据前。
+- 涉及文件：src/prizm/engine/duckdb_engine.py
 - 登记日期：2026-11-21
 - 还清记录：—
 

@@ -10,6 +10,7 @@ import pandas as pd
 
 from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
 from prizm.agent.planner import Planner
+from prizm.agent.repair import RepairAttempt, Repairer
 from prizm.datasource.base import BaseConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
 from prizm.profiling.models import ProfileReport
@@ -22,10 +23,16 @@ class Answer:
     sql: str
     dataframe: pd.DataFrame
     chart: dict[str, Any] | None = None
+    attempts: int = 1
+    repair_history: tuple[RepairAttempt, ...] = ()
 
     @property
     def empty(self) -> bool:
         return bool(self.dataframe.empty)
+
+    @property
+    def repaired(self) -> bool:
+        return self.attempts > 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +76,12 @@ class Orchestrator:
         profile_options: ProfileOptions | None = None,
         primary_key: str | Sequence[str] | None = None,
         clarify_gate: ClarifyGate | None = None,
+        repairer: Repairer | None = None,
     ) -> None:
         self._frame = connector.load()
         self._engine = engine
         self._planner = planner
+        self._repairer = repairer or Repairer(planner, engine)
         self._profile_options = profile_options or ProfileOptions()
         self._profile = profile_frame(
             self._frame,
@@ -131,7 +140,7 @@ class Orchestrator:
 
     def _execute(self, question: str) -> Answer:
         policies = self._clarify_gate.policy_summary()
-        plan = self._planner.plan(
+        outcome = self._repairer.run(
             question,
             self.view_name,
             self._frame,
@@ -140,12 +149,13 @@ class Orchestrator:
             ),
             confirmed_policies=policies or None,
         )
-        result = self._engine.execute(plan.sql)
         return Answer(
             question=question,
-            sql=plan.sql,
-            dataframe=result,
-            chart=plan.chart,
+            sql=outcome.plan.sql,
+            dataframe=outcome.dataframe,
+            chart=outcome.plan.chart,
+            attempts=outcome.attempts,
+            repair_history=outcome.history,
         )
 
     @staticmethod

@@ -20,15 +20,18 @@
 - 2026-11-21 任务 1-1：配置 + CSV connector + DuckDB 只读执行引擎
 - 2026-11-21 任务 1-2：LLM adapter（mock 默认 / litellm 切换）+ planner + orchestrator
 - 2026-11-21 任务 1-3：Chainlit CSV 上传→提问→SQL/结果展示；69 项 pytest 全绿
+- 2026-11-21 任务 1-4：LLM 配置加固：`PRIZM_LLM_API_BASE` 显式传 api_base、按 provider 取 key、缺 key 启动即报错；82 项 pytest 全绿
 
 ## 进行中
 - 无
 
 ## 下一步
+- 偿还 DEBT-002（触发条件已命中）：token/费用统计 + 每日额度与会话次数上限
 - 阶段 P0：数据体检 profiler（缺失/重复/脏格式检测 + 紧凑体检报告）
 
 ## 阻塞与风险
-- 非阻塞：DEBT-001/002/003 为阶段 1 已知简化，触发条件均未命中
+- DEBT-002 触发条件已命中（`.env` 已有真实 key 与 base_url），列为下一任务
+- 非阻塞：DEBT-001/003/004 为已知简化，触发条件均未命中
 
 ## 关键入口
 - 需求：docs/requirements.md ｜ 架构：docs/architecture.md

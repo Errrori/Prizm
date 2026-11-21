@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
-from prizm.config import Settings
+from prizm.config import PROVIDER_KEY_ENV, Settings
 
 Message = dict[str, str]
 CompletionFn = Callable[..., Any]
@@ -18,6 +18,10 @@ CompletionFn = Callable[..., Any]
 
 class LLMError(RuntimeError):
     """LLM 调用失败或返回结构非法。"""
+
+
+class LLMConfigError(LLMError):
+    """模型配置不完整或不匹配，启动阶段即失败。"""
 
 
 class LLMAdapter(Protocol):
@@ -42,11 +46,13 @@ class LiteLLMAdapter:
 
     model: str
     api_key: str | None = None
+    api_base: str | None = None
     completion_fn: CompletionFn | None = None
 
     def _completion(self) -> CompletionFn:
         if self.completion_fn is not None:
             return self.completion_fn
+        # DEBT-004: litellm 导入时会自行 load_dotenv(), 本层未隔离 .env 与 os.environ。
         from litellm import completion
 
         return cast(CompletionFn, completion)
@@ -60,6 +66,8 @@ class LiteLLMAdapter:
         }
         if self.api_key:
             kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
         try:
             response = self._completion()(**kwargs)
         except Exception as exc:
@@ -75,9 +83,19 @@ class LiteLLMAdapter:
 
 
 def build_llm(settings: Settings, *, response: str | None = None) -> LLMAdapter:
-    """按配置构建适配器；mock 模式不触网。"""
+    """按配置构建适配器；mock 模式不触网。
+
+    真实模型要求当前 provider 的 key 已配置，且 api_base 显式由配置传入，
+    避免依赖 litellm 隐式读取 .env。
+    """
     if settings.is_mock:
         return MockLLM() if response is None else MockLLM(response)
 
-    api_key = settings.dashscope_api_key or settings.openai_api_key or settings.anthropic_api_key
-    return LiteLLMAdapter(settings.default_model, api_key=api_key)
+    provider = settings.llm_provider
+    api_key = settings.llm_api_key
+    if not api_key:
+        env_name = PROVIDER_KEY_ENV[provider]
+        raise LLMConfigError(
+            f"模型 {settings.default_model} 属于 {provider}，需要环境变量 {env_name}，当前未配置"
+        )
+    return LiteLLMAdapter(settings.default_model, api_key=api_key, api_base=settings.llm_api_base)

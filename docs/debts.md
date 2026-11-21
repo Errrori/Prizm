@@ -54,3 +54,12 @@
 - 涉及文件：src/prizm/datasource/csv_connector.py
 - 登记日期：2026-11-21
 - 还清记录：—
+
+### DEBT-004 litellm 自身的 .env 加载未隔离
+- 状态：未还
+- 现状：`LiteLLMAdapter` 已显式传 `api_key` / `api_base`，但 `import litellm` 仍会自行执行 `load_dotenv()`（按进程 CWD 找 `.env`）并把其中的 key 注入 `os.environ`；未固定 `.env` 路径，也未隔离环境变量。
+- 为什么简化：阶段 1 为单机开发运行，显式传参已覆盖主路径。
+- 触发条件：容器化部署，或多环境（dev/prod 共用进程环境 / CWD 不固定）部署前。
+- 涉及文件：src/prizm/llm/adapter.py, src/prizm/config.py
+- 登记日期：2026-11-21
+- 还清记录：—

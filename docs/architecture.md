@@ -176,7 +176,7 @@ Prizm/
 
 - `prizm.datasource.base.BaseConnector`：`load() -> pd.DataFrame`（会话内缓存一次）、`view_name: str`、`register(engine)`；新增数据源继承并实现 `_read()`。CSV 实现在 `datasource/csv_connector.py`，视图名由 `sanitize_view_name` 清洗。
 - `prizm.engine.duckdb_engine.DuckDBEngine`：`register_dataframe(name, df)`、`execute(sql, max_rows=None) -> pd.DataFrame`、`close()`；构造参数 `memory_limit / threads / timeout_seconds`，内部执行只读校验并设 `enable_external_access=false`。
-- `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> str`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings)` 按模型配置切换。
+- `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> str`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings)` 按模型配置切换。真实模型按模型名判定 provider（qwen→dashscope / claude→anthropic / 其余→openai），只取对应 provider 的 key，缺 key 抛 `LLMConfigError`；`PRIZM_LLM_API_BASE` 显式作为 `api_base` 传给 litellm，不依赖其隐式读 `.env`。
 - `prizm.agent.planner.Planner.plan(question, view_name, frame) -> Plan(sql, chart)`：prompt 只含 schema + 前 5 行样本；`parse_plan` 校验 JSON 并解析可选 chart。
 - `prizm.agent.orchestrator.Orchestrator(connector, engine, planner).ask(question) -> Answer(question, sql, dataframe, chart)`；`format_result_table` 负责文本展示。
 - 入口 `app/main.py`：Chainlit 上传 CSV → 注册 DuckDB → 提问 → 展示 SQL + 结果；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。

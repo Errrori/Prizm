@@ -4,7 +4,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from prizm.agent.orchestrator import Orchestrator, format_result_table
+from prizm.agent.orchestrator import (
+    Answer,
+    Clarification,
+    Orchestrator,
+    format_result_table,
+)
 from prizm.agent.planner import Planner
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
@@ -31,6 +36,17 @@ def write_orders(path: Path) -> None:
     ).to_csv(path, index=False, encoding="utf-8")
 
 
+def write_dirty_orders(path: Path) -> None:
+    pd.DataFrame(
+        {
+            "order_id": [1, 1, 2, 2, 3],
+            "channel": ["线上", "线上", "线下", "线下", "线上"],
+            "quantity": [1, None, 2, 2, 4],
+            "sales": ["1,200", "800", "800", "800", "300"],
+        }
+    ).to_csv(path, index=False, encoding="utf-8")
+
+
 def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "orders.csv"
     write_orders(path)
@@ -38,10 +54,7 @@ def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     llm = MockLLM(
         json.dumps(
             {
-                "sql": (
-                    "SELECT SUM(sales) AS total FROM orders "
-                    "WHERE status = '已完成'"
-                ),
+                "sql": ("SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"),
                 "chart": None,
             }
         )
@@ -66,7 +79,7 @@ def test_orchestrator_builds_profile_and_injects_summary(tmp_path: Path) -> None
 
     with DuckDBEngine() as engine:
         orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
-        orchestrator.ask("概览")
+        orchestrator.ask("按渠道统计销售额")
 
     assert orchestrator.profile.row_count == 3
     assert "数据体检" in llm.calls[0][1]["content"]
@@ -93,3 +106,74 @@ def test_format_result_table_truncates() -> None:
 
 def test_format_result_table_handles_empty_frame() -> None:
     assert format_result_table(pd.DataFrame()) == "（查询结果为空）"
+
+
+def test_orchestrator_returns_clarification_without_planning(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_dirty_orders(path)
+    llm = MockLLM(json.dumps({"sql": "SELECT 1 AS ok", "chart": None}))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        result = orchestrator.ask("统计销售额")
+
+    assert isinstance(result, Clarification)
+    assert llm.calls == []
+    assert orchestrator.pending_clarification is not None
+
+
+def test_orchestrator_executes_after_all_clarifications(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_dirty_orders(path)
+    llm = MockLLM(json.dumps({"sql": "SELECT 1 AS ok", "chart": None}))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        result = orchestrator.ask("统计销售额")
+        rounds = 0
+        while isinstance(result, Clarification):
+            rounds += 1
+            result = orchestrator.resolve(result.request.options[0].value)
+
+    assert rounds >= 4
+    assert isinstance(result, Answer)
+    assert orchestrator.pending_clarification is None
+    assert llm.calls
+    prompt = llm.calls[0][1]["content"]
+    assert "用户已确认的数据口径" in prompt
+    assert result.sql == "SELECT 1 AS ok"
+
+
+def test_orchestrator_rejects_invalid_clarification_option(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_dirty_orders(path)
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(MockLLM()))
+        orchestrator.ask("统计销售额")
+
+        with pytest.raises(ValueError, match="无效的澄清选项"):
+            orchestrator.resolve("not-an-option")
+
+
+def test_orchestrator_rejects_new_question_while_pending(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_dirty_orders(path)
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(MockLLM()))
+        orchestrator.ask("统计销售额")
+
+        with pytest.raises(RuntimeError, match="未完成的澄清"):
+            orchestrator.ask("另一个问题")
+
+
+def test_orchestrator_resolve_without_pending_raises(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(MockLLM()))
+
+        with pytest.raises(RuntimeError, match="没有待澄清"):
+            orchestrator.resolve("dedupe_keep_first")

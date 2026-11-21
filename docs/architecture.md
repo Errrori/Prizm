@@ -168,7 +168,7 @@ Prizm/
 │  ├─ viz/charts.py          # chart spec → matplotlib PNG
 │  └─ utils/                 # logging / tokens（额度）
 ├─ tests/{unit,integration,fixtures}
-├─ eval/{datasets,run_eval.py,metrics.py}
+├─ eval/{datasets,run_eval.py,run_clarify.py,metrics.py}
 └─ scripts/gen_data_dict.py
 ```
 
@@ -178,7 +178,9 @@ Prizm/
 - `prizm.engine.duckdb_engine.DuckDBEngine`：`register_dataframe(name, df)`、`execute(sql, max_rows=None) -> pd.DataFrame`、`close()`；构造参数 `memory_limit / threads / timeout_seconds`，内部执行只读校验并设 `enable_external_access=false`。
 - `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> Completion(text, usage)`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings, *, response=None, ledger=None, daily_token_budget=None)` 按模型配置切换。真实模型按模型名判定 provider（qwen→dashscope / claude→anthropic / 其余→openai），只取对应 provider 的 key，缺 key 抛 `LLMConfigError`；`PRIZM_LLM_API_BASE` 显式作为 `api_base` 传给 litellm，不依赖其隐式读 `.env`。传入 `ledger` 时每次调用前检查额度、调用后记录 token/费用。
 - `prizm.utils.tokens`：`Usage(prompt_tokens, completion_tokens, total_tokens, cost_usd)`、`Completion(text, usage)`、`DailyUsageLedger`（按自然日累计，跨日清零，线程安全）、`SessionTurnCounter`（单会话次数限制，0 表示不限）、`QuotaExceededError`。
-- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；`parse_plan` 校验 JSON 并解析可选 chart。
-- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None).ask(question) -> Answer(question, sql, dataframe, chart)`；构造时自动体检一次，`profile` 属性暴露 `ProfileReport`，提问时注入紧凑摘要；`format_result_table` 负责文本展示。
+- `prizm.agent.clarify`：`ClarifyGate.judge(question, profile) -> ClarifyDecision(requests)` 在规划前判定是否反问；异常按类型分组（完全重复/主键重复/缺失/脏数值），仅当问题命中受影响列或聚合类词时才问；`confirm(code, choice, question=None)` 记录会话级口径，`policy_summary()` 供 planner 注入；问题模糊时可用 `LLMAmbiguityJudge` 按 JSON 判定，判定失败回退关键词启发式；`parse_ambiguity_response` 负责校验模型输出。
+- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；`parse_plan` 校验 JSON 并解析可选 chart。
+- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None).ask(question) -> Answer | Clarification`；构造时自动体检一次，`profile` 属性暴露 `ProfileReport`；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后重跑原问题并注入口径；`format_result_table` 负责文本展示。
+- `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
 - 入口 `app/main.py`：Chainlit 上传 CSV → 注册 DuckDB → 生成并展示体检报告 → 提问 → 展示 SQL + 结果；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。

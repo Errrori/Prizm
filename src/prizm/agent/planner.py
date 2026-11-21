@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,7 @@ JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 - 只能使用给定 schema 中存在的列，不要臆造列名。
 - 标识符必要时用双引号包裹。
 - 体检摘要中的异常仅作上下文提示，不要据此臆造数据或擅自改变统计口径。
+- 若提供了用户已确认的数据口径，必须严格遵循，不得自行更改。
 - 本阶段不绘图，chart 必须为 null。"""
 
 
@@ -51,6 +53,7 @@ def build_plan_prompt(
     *,
     sample_rows: int = 5,
     profile_summary: str | None = None,
+    confirmed_policies: Mapping[str, str] | None = None,
 ) -> list[Message]:
     """构造规划 prompt：只注入 schema + 体检摘要或前若干行样本，绝不注入全量数据。"""
     if profile_summary:
@@ -62,6 +65,9 @@ def build_plan_prompt(
             f"前 {sample_rows} 行样本（JSON）：\n"
             f"{json.dumps(sample, ensure_ascii=False, default=str)}"
         )
+    if confirmed_policies:
+        policies = "\n".join(f"- {name}：{choice}" for name, choice in confirmed_policies.items())
+        context += f"\n\n用户已确认的数据口径（必须遵守）：\n{policies}"
     user_prompt = f"数据集视图：{view_name}\n{context}\n问题：{question}"
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -106,6 +112,7 @@ class Planner:
         frame: pd.DataFrame,
         *,
         profile_summary: str | None = None,
+        confirmed_policies: Mapping[str, str] | None = None,
     ) -> Plan:
         if not question.strip():
             raise ValueError("问题不能为空")
@@ -115,5 +122,6 @@ class Planner:
             frame,
             sample_rows=self.sample_rows,
             profile_summary=profile_summary,
+            confirmed_policies=confirmed_policies,
         )
         return parse_plan(self.llm.complete(messages).text)

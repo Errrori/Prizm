@@ -1,4 +1,4 @@
-"""最薄端到端编排：连接器 → 体检 → DuckDB → Planner → 执行 → 结果。"""
+"""最薄端到端编排：连接器 → 体检 → 澄清门禁 → Planner → 执行 → 结果。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pandas as pd
 
+from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
 from prizm.agent.planner import Planner
 from prizm.datasource.base import BaseConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
@@ -15,7 +16,7 @@ from prizm.profiling.models import ProfileReport
 from prizm.profiling.profiler import ProfileOptions, profile_frame
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Answer:
     question: str
     sql: str
@@ -27,8 +28,37 @@ class Answer:
         return bool(self.dataframe.empty)
 
 
+@dataclass(frozen=True, slots=True)
+class Clarification:
+    question: str
+    request: ClarificationRequest
+    remaining: int = 0
+
+
+@dataclass
+class _PendingClarification:
+    question: str
+    requests: tuple[ClarificationRequest, ...]
+    index: int = 0
+
+    @property
+    def current(self) -> ClarificationRequest:
+        return self.requests[self.index]
+
+    @property
+    def remaining_after(self) -> int:
+        return len(self.requests) - self.index - 1
+
+    @property
+    def done(self) -> bool:
+        return self.index >= len(self.requests)
+
+    def advance(self) -> None:
+        self.index += 1
+
+
 class Orchestrator:
-    """单数据集、单轮问答；上传后立即体检，提问时注入紧凑摘要。"""
+    """单数据集、单轮问答；上传后立即体检，提问时先过澄清门禁。"""
 
     def __init__(
         self,
@@ -38,6 +68,7 @@ class Orchestrator:
         *,
         profile_options: ProfileOptions | None = None,
         primary_key: str | Sequence[str] | None = None,
+        clarify_gate: ClarifyGate | None = None,
     ) -> None:
         self._frame = connector.load()
         self._engine = engine
@@ -50,6 +81,8 @@ class Orchestrator:
         )
         connector.register(engine)
         self.view_name = connector.view_name
+        self._clarify_gate = clarify_gate or ClarifyGate()
+        self._pending: _PendingClarification | None = None
 
     @property
     def dataframe(self) -> pd.DataFrame:
@@ -59,24 +92,77 @@ class Orchestrator:
     def profile(self) -> ProfileReport:
         return self._profile
 
-    def ask(self, question: str) -> Answer:
+    @property
+    def pending_clarification(self) -> Clarification | None:
+        if self._pending is None:
+            return None
+        return self._as_clarification(self._pending)
+
+    def ask(self, question: str) -> Answer | Clarification:
         if not question.strip():
             raise ValueError("问题不能为空")
+        if self._pending is not None:
+            raise RuntimeError("存在未完成的澄清，请先回答澄清问题")
+        return self._advance(question.strip())
+
+    def resolve(self, value: str) -> Answer | Clarification:
+        """记录用户对当前澄清项的回复；全部澄清完成后重跑原问题。"""
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("当前没有待澄清的问题")
+        option = _match_option(pending.current, value)
+        self._clarify_gate.confirm(
+            pending.current.code,
+            option.label,
+            question=pending.question,
+        )
+        pending.advance()
+        if not pending.done:
+            return self._as_clarification(pending)
+        self._pending = None
+        return self._advance(pending.question)
+
+    def _advance(self, question: str) -> Answer | Clarification:
+        decision = self._clarify_gate.judge(question, self._profile)
+        if decision.needs_clarification:
+            self._pending = _PendingClarification(question, decision.requests)
+            return self._as_clarification(self._pending)
+        return self._execute(question)
+
+    def _execute(self, question: str) -> Answer:
+        policies = self._clarify_gate.policy_summary()
         plan = self._planner.plan(
-            question.strip(),
+            question,
             self.view_name,
             self._frame,
             profile_summary=self._profile.to_prompt(
                 max_chars=self._profile_options.max_prompt_chars
             ),
+            confirmed_policies=policies or None,
         )
         result = self._engine.execute(plan.sql)
         return Answer(
-            question=question.strip(),
+            question=question,
             sql=plan.sql,
             dataframe=result,
             chart=plan.chart,
         )
+
+    @staticmethod
+    def _as_clarification(pending: _PendingClarification) -> Clarification:
+        return Clarification(
+            question=pending.question,
+            request=pending.current,
+            remaining=pending.remaining_after,
+        )
+
+
+def _match_option(request: ClarificationRequest, value: str) -> ClarificationOption:
+    text = value.strip()
+    for option in request.options:
+        if text in {option.value, option.label}:
+            return option
+    raise ValueError(f"无效的澄清选项: {value!r}")
 
 
 def format_result_table(frame: pd.DataFrame, *, max_rows: int = 20) -> str:

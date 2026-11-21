@@ -22,6 +22,7 @@ htmlcov/
 .data/
 .cache/
 .chainlit/
+eval/outcomes/
 
 # OS / editor
 .DS_Store

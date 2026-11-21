@@ -126,7 +126,7 @@ flowchart TD
 
 - **密钥**：仅来自环境变量或会话输入，只存内存；不落盘、不打日志、不进仓库。
 - **执行**：默认无自由代码执行；SQL 只读 + 限额；pandas 兜底必须过白名单与超时。
-- **评测与单测分离**：`unit`/`integration` 确定性、可 mock LLM、进 CI；`eval` 统计性、慢、默认排除（`-m 'not eval'`）。
+- **评测与单测分离**：`unit`/`integration` 确定性、可 mock LLM、进 CI；`eval` 统计性、慢、默认排除（`-m 'not eval'`）。`eval/run_eval.py --execute` 需要真实模型 key，只用于阶段性验收，不进入默认 CI。
 - **单一事实源**：依赖/版本只在 `pyproject.toml`；本文只记为什么。
 - **数据不重复加载**：会话内 df/关系缓存一次，多轮复用。
 
@@ -182,6 +182,7 @@ Prizm/
 - `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, repair_feedback=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；有修复反馈时追加“上一次尝试失败，需要修复”段；`parse_plan` 校验 JSON 并解析可选 chart。
 - `prizm.agent.repair.Repairer(planner, engine, max_attempts=3).run(question, view_name, frame, *, profile_summary=None, confirmed_policies=None) -> RepairResult(plan, dataframe, attempts, history)`：总尝试不超过 3 次（含首次）；解析/校验/执行/超时错误回传错误类型与消息并重新规划，LLM 调用失败与额度超限不重试；耗尽抛 `RepairFailed(question, attempts, last_error)`。`format_repair_error` 不回传本机 traceback。
 - `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None, repairer=None).ask(question) -> Answer | Clarification`；构造时自动体检一次，`profile` 属性暴露 `ProfileReport`；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后重跑原问题并注入口径；执行经 `Repairer`，`Answer` 暴露 `attempts / repaired / repair_history`；`format_result_table` 负责文本展示。
+- `eval/run_eval.py`：`--execute` 用真实模型逐题创建 Connector/Engine/Orchestrator，单题异常记录为 `TaskOutcome.error` 且不中断整批；`matches_expected` 按标量/记录列表做启发式比对；`--outcomes` 写 JSONL，`--results` 读取 JSONL 算指标。`--execute` 拒绝 mock，支持 `--limit / --max-attempts`；`TaskOutcome` 新增 `attempts / error`，`first_pass_ok` 按“最终正确且未触发自修复”判定，澄清类任务按门禁是否正确触发判定成功。
 - `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
 - 入口 `app/main.py`：Chainlit 上传 CSV → 注册 DuckDB → 生成并展示体检报告 → 提问 → 展示 SQL + 结果；自修复成功时在 Step 展示尝试次数与修复记录，`RepairFailed` 时展示最终错误；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。

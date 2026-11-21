@@ -61,6 +61,8 @@ class TaskOutcome:
     final_ok: bool
     expected_clarification: bool = False
     clarification_triggered: bool = False
+    attempts: int = 1
+    error: str = ""
     expected_anomalies: int = 0
     detected_anomalies: int = 0
     rag_citations_total: int = 0
@@ -69,6 +71,14 @@ class TaskOutcome:
     def __post_init__(self) -> None:
         if self.category not in CATEGORIES:
             raise ValueError(f"未知 category: {self.category!r}")
+        if (
+            not isinstance(self.attempts, int)
+            or isinstance(self.attempts, bool)
+            or self.attempts < 1
+        ):
+            raise ValueError("attempts 必须是 >= 1 的整数")
+        if not isinstance(self.error, str):
+            raise ValueError("error 必须是字符串")
         for field_name in (
             "expected_anomalies",
             "detected_anomalies",

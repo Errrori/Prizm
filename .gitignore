@@ -21,6 +21,7 @@ htmlcov/
 *.log
 .data/
 .cache/
+.chainlit/
 
 # OS / editor
 .DS_Store

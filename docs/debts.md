@@ -27,3 +27,30 @@
 ---
 
 ## 台账
+
+### DEBT-001 SQL 只读校验基于关键字黑名单
+- 状态：未还
+- 现状：`ensure_read_only_sql` 用 SELECT/WITH 前缀 + 关键字/函数黑名单拦截，未做 SQL AST 解析。
+- 为什么简化：阶段 1 只需跑通链路；DuckDB 已设 `enable_external_access=false`，黑名单作为第二道防线。
+- 触发条件：接入自修复（repair）前必须复核。
+- 涉及文件：src/prizm/engine/duckdb_engine.py
+- 登记日期：2026-11-21
+- 还清记录：—
+
+### DEBT-002 LLM 额度与调用统计未实现
+- 状态：未还
+- 现状：`LiteLLMAdapter` 只做单次 completion，未统计 token/费用，未执行每日额度与会话次数上限。
+- 为什么简化：阶段 1 默认走 mock，不产生真实调用。
+- 触发条件：首次接入真实模型 key 联调前。
+- 涉及文件：src/prizm/config.py, src/prizm/llm/adapter.py
+- 登记日期：2026-11-21
+- 还清记录：—
+
+### DEBT-003 CSV 编码采用启发式回退
+- 状态：未还
+- 现状：按 UTF-8(BOM) → GBK 顺序尝试，未做 charset 检测；非 GBK 字节可能被误解为乱码而不报错。
+- 为什么简化：当前评测数据集为 UTF-8，先覆盖常见中文 CSV。
+- 触发条件：接入真实用户上传文件前。
+- 涉及文件：src/prizm/datasource/csv_connector.py
+- 登记日期：2026-11-21
+- 还清记录：—

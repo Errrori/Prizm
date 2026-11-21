@@ -14,6 +14,7 @@ from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMError, build_llm
+from prizm.profiling.profiler import format_profile_report
 from prizm.utils.tokens import DailyUsageLedger, QuotaExceededError, SessionTurnCounter
 
 _usage_ledger = DailyUsageLedger()
@@ -62,7 +63,8 @@ async def on_chat_start() -> None:
     await cl.Message(
         content=(
             f"已加载 `{uploaded.name}`：{len(frame)} 行 × {len(frame.columns)} 列。\n"
-            f"当前模型：{mode}。可以开始提问。"
+            f"当前模型：{mode}。\n\n"
+            f"{format_profile_report(orchestrator.profile)}"
         )
     ).send()
 

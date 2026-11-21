@@ -38,6 +38,33 @@ def test_prompt_injects_only_sample_rows() -> None:
     assert messages[0]["role"] == "system"
 
 
+def test_prompt_uses_profile_summary_when_provided() -> None:
+    frame = pd.DataFrame({"id": range(50), "value": [f"v{i}" for i in range(50)]})
+    summary = "数据体检：50 行 × 2 列\n异常：未发现"
+
+    messages = build_plan_prompt(
+        "有多少行？",
+        "orders",
+        frame,
+        profile_summary=summary,
+    )
+    user_content = messages[1]["content"]
+
+    assert summary in user_content
+    assert "列与类型" not in user_content
+    assert "v49" not in user_content
+
+
+def test_planner_passes_profile_summary_to_llm() -> None:
+    frame = pd.DataFrame({"sales": [1, 2]})
+    llm = MockLLM(json.dumps({"sql": "SELECT 1", "chart": None}))
+    planner = Planner(llm)
+
+    planner.plan("销售额", "orders", frame, profile_summary="数据体检：2 行 × 1 列")
+
+    assert "数据体检：2 行 × 1 列" in llm.calls[0][1]["content"]
+
+
 def test_parse_plan_accepts_fenced_json() -> None:
     text = '```json\n{"sql": "SELECT 1", "chart": null}\n```'
 

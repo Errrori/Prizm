@@ -59,6 +59,20 @@ def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     assert llm.calls
 
 
+def test_orchestrator_builds_profile_and_injects_summary(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    llm = MockLLM(json.dumps({"sql": "SELECT 1 AS ok", "chart": None}))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        orchestrator.ask("概览")
+
+    assert orchestrator.profile.row_count == 3
+    assert "数据体检" in llm.calls[0][1]["content"]
+    assert "sales" in llm.calls[0][1]["content"]
+
+
 def test_orchestrator_rejects_empty_question(tmp_path: Path) -> None:
     path = tmp_path / "orders.csv"
     write_orders(path)

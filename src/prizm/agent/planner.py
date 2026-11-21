@@ -20,6 +20,7 @@ JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 - 只能生成单条 SELECT 或 WITH ... SELECT 语句，禁止任何写操作或 DDL。
 - 只能使用给定 schema 中存在的列，不要臆造列名。
 - 标识符必要时用双引号包裹。
+- 体检摘要中的异常仅作上下文提示，不要据此臆造数据或擅自改变统计口径。
 - 本阶段不绘图，chart 必须为 null。"""
 
 
@@ -49,16 +50,19 @@ def build_plan_prompt(
     frame: pd.DataFrame,
     *,
     sample_rows: int = 5,
+    profile_summary: str | None = None,
 ) -> list[Message]:
-    """构造规划 prompt：只注入 schema + 前若干行样本，绝不注入全量数据。"""
-    sample = frame.head(sample_rows).to_dict(orient="records")
-    user_prompt = (
-        f"数据集视图：{view_name}\n"
-        f"列与类型：\n{build_schema_summary(frame)}\n"
-        f"前 {sample_rows} 行样本（JSON）：\n"
-        f"{json.dumps(sample, ensure_ascii=False, default=str)}\n"
-        f"问题：{question}"
-    )
+    """构造规划 prompt：只注入 schema + 体检摘要或前若干行样本，绝不注入全量数据。"""
+    if profile_summary:
+        context = f"数据体检摘要：\n{profile_summary}"
+    else:
+        sample = frame.head(sample_rows).to_dict(orient="records")
+        context = (
+            f"列与类型：\n{build_schema_summary(frame)}\n"
+            f"前 {sample_rows} 行样本（JSON）：\n"
+            f"{json.dumps(sample, ensure_ascii=False, default=str)}"
+        )
+    user_prompt = f"数据集视图：{view_name}\n{context}\n问题：{question}"
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
@@ -95,7 +99,14 @@ class Planner:
     llm: LLMAdapter
     sample_rows: int = 5
 
-    def plan(self, question: str, view_name: str, frame: pd.DataFrame) -> Plan:
+    def plan(
+        self,
+        question: str,
+        view_name: str,
+        frame: pd.DataFrame,
+        *,
+        profile_summary: str | None = None,
+    ) -> Plan:
         if not question.strip():
             raise ValueError("问题不能为空")
         messages = build_plan_prompt(
@@ -103,5 +114,6 @@ class Planner:
             view_name,
             frame,
             sample_rows=self.sample_rows,
+            profile_summary=profile_summary,
         )
         return parse_plan(self.llm.complete(messages).text)

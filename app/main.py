@@ -29,9 +29,9 @@ from prizm.llm.adapter import LLMError, build_llm
 from prizm.profiling.profiler import format_profile_report
 from prizm.rag.ingest import DictionaryEntry, build_data_dictionary, load_dictionary_file
 from prizm.rag.retriever import DataDictionaryRetriever, DictionaryAnswer, DictionaryQA
-from prizm.utils.tokens import DailyUsageLedger, QuotaExceededError, SessionTurnCounter
+from prizm.utils.tokens import QuotaExceededError, SessionTurnCounter, SqliteUsageLedger
 
-_usage_ledger = DailyUsageLedger()
+_usage_ledger = SqliteUsageLedger(get_settings().usage_ledger_path)
 
 
 @cl.on_chat_start

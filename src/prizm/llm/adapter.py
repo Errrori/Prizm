@@ -6,12 +6,13 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 from prizm.config import PROVIDER_KEY_ENV, Settings
-from prizm.utils.tokens import Completion, DailyUsageLedger, Usage
+from prizm.utils.tokens import Completion, Usage, UsageLedger
 
 Message = dict[str, str]
 CompletionFn = Callable[..., Any]
@@ -77,6 +78,12 @@ def extract_usage(response: Any) -> Usage:
     )
 
 
+def _configure_litellm_env() -> None:
+    """隔离 litellm 的进程默认值：不读 CWD .env，也不联网拉成本表。"""
+    os.environ.setdefault("LITELLM_MODE", "PROD")
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+
 @dataclass
 class LiteLLMAdapter:
     """litellm 封装；completion_fn 可在测试中注入，避免网络与真实 key。"""
@@ -85,17 +92,20 @@ class LiteLLMAdapter:
     api_key: str | None = None
     api_base: str | None = None
     completion_fn: CompletionFn | None = None
-    ledger: DailyUsageLedger | None = None
+    ledger: UsageLedger | None = None
     daily_token_budget: int | None = None
+    max_retries: int = 0
 
     def __post_init__(self) -> None:
         if self.daily_token_budget is not None and self.daily_token_budget < 0:
             raise ValueError("daily_token_budget 不能为负数")
+        if self.max_retries < 0:
+            raise ValueError("max_retries 不能为负数")
 
     def _completion(self) -> CompletionFn:
         if self.completion_fn is not None:
             return self.completion_fn
-        # DEBT-004: litellm 导入时会自行 load_dotenv(), 本层未隔离 .env 与 os.environ。
+        _configure_litellm_env()
         from litellm import completion
 
         return cast(CompletionFn, completion)
@@ -113,6 +123,8 @@ class LiteLLMAdapter:
             kwargs["api_key"] = self.api_key
         if self.api_base:
             kwargs["api_base"] = self.api_base
+        if self.max_retries > 0:
+            kwargs["num_retries"] = self.max_retries
         try:
             response = self._completion()(**kwargs)
         except Exception as exc:
@@ -135,7 +147,7 @@ def build_llm(
     settings: Settings,
     *,
     response: str | None = None,
-    ledger: DailyUsageLedger | None = None,
+    ledger: UsageLedger | None = None,
     daily_token_budget: int | None = None,
 ) -> LLMAdapter:
     """按配置构建适配器；mock 模式不触网。
@@ -160,4 +172,5 @@ def build_llm(
         api_base=settings.llm_api_base,
         ledger=ledger,
         daily_token_budget=budget if ledger is not None else None,
+        max_retries=settings.llm_max_retries,
     )

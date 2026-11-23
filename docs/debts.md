@@ -56,22 +56,22 @@
 - 还清记录：—
 
 ### DEBT-004 litellm 自身的 .env 加载未隔离
-- 状态：未还
+- 状态：已还清
 - 现状：`LiteLLMAdapter` 已显式传 `api_key` / `api_base`，但 `import litellm` 仍会自行执行 `load_dotenv()`（按进程 CWD 找 `.env`）并把其中的 key 注入 `os.environ`；未固定 `.env` 路径，也未隔离环境变量。
 - 为什么简化：阶段 1 为单机开发运行，显式传参已覆盖主路径。
 - 触发条件：容器化部署，或多环境（dev/prod 共用进程环境 / CWD 不固定）部署前。
 - 涉及文件：src/prizm/llm/adapter.py, src/prizm/config.py
 - 登记日期：2026-11-21
-- 还清记录：—
+- 还清记录：2026-11-23 任务 9-1：import litellm 前设置 `LITELLM_MODE=PROD`（禁止自动 load_dotenv）与 `LITELLM_LOCAL_MODEL_COST_MAP=True`（不联网拉成本表）；新增子进程回归测试验证 CWD `.env` 不会泄漏进环境。commit 见本任务 git log。
 
 ### DEBT-005 每日额度台账仅存进程内存
-- 状态：未还
+- 状态：已还清
 - 现状：`DailyUsageLedger` 只保存在当前进程内，进程重启或部署多副本时每日 token 用量会归零/不共享。
 - 为什么简化：当前为单机 demo，单进程即可满足每日额度限制。
 - 触发条件：在线 demo 部署，或多进程/多副本运行前。
 - 涉及文件：src/prizm/utils/tokens.py, app/main.py
 - 登记日期：2026-11-21
-- 还清记录：—
+- 还清记录：2026-11-23 任务 9-1：新增 `SqliteUsageLedger`（按自然日 upsert，跨日清零），app 按 `PRIZM_USAGE_LEDGER_PATH` 使用，Docker 将 `/data` 挂为持久卷；重启与同机多进程共享额度。commit 见本任务 git log。
 
 ### DEBT-006 费用统计依赖 litellm 响应内部字段
 - 状态：未还
@@ -232,6 +232,24 @@
 - 为什么简化：先保证结果链路不被额外模型调用拖垮，避免把结论生成引入首轮成功率指标；模板兜底保证始终有输出。
 - 触发条件：需要对外报告结论质量、或真实模型验收要求结论可信度时。
 - 涉及文件：src/prizm/agent/composer.py, src/prizm/agent/orchestrator.py, eval/run_eval.py
+- 登记日期：2026-11-23
+- 还清记录：—
+
+### DEBT-024 评测集仅 10 题，未达需求约 50 题规模
+- 状态：未还
+- 现状：`eval/tasks.jsonl` 只有 10 题，覆盖 cleaning / aggregation / trend / attribution / multi_turn；数据集只有 `orders.csv` 与 `orders_dirty.csv`，未达到需求约定的约 50 题 × 3 个公开风格数据集。
+- 为什么简化：先跑通真实模型执行入口与指标；标准答案需人工设计，避免用模板答案自证。
+- 触发条件：对外正式验收、或宣称完成需求第 7 节全部评测指标前。
+- 涉及文件：eval/tasks.jsonl, eval/datasets, docs/requirements.md
+- 登记日期：2026-11-23
+- 还清记录：—
+
+### DEBT-025 README 演示 GIF 未录制
+- 状态：未还
+- 现状：README 已包含架构图、文字流程与评测表，但没有演示 GIF；当前环境未引入浏览器录屏/自动化截图链路。
+- 为什么简化：优先完成可运行链路、容器与评测，把 UI 录屏留到交付展示阶段。
+- 触发条件：项目对外展示、投递或要求提供演示材料前。
+- 涉及文件：README.md
 - 登记日期：2026-11-23
 - 还清记录：—
 

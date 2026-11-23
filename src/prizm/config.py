@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     duckdb_memory_limit: str = Field(default="1GB", validation_alias="PRIZM_DUCKDB_MEMORY_LIMIT")
     duckdb_threads: int = Field(default=2, validation_alias="PRIZM_DUCKDB_THREADS")
     sql_timeout_seconds: float = Field(default=30.0, validation_alias="PRIZM_SQL_TIMEOUT_SECONDS")
+    llm_max_retries: int = Field(default=2, validation_alias="PRIZM_LLM_MAX_RETRIES")
+    usage_ledger_path: str = Field(
+        default=".data/usage.sqlite3",
+        validation_alias="PRIZM_USAGE_LEDGER_PATH",
+    )
 
     openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     dashscope_api_key: str | None = Field(default=None, validation_alias="DASHSCOPE_API_KEY")

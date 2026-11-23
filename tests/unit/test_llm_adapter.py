@@ -1,3 +1,7 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -220,6 +224,70 @@ def test_build_llm_passes_ledger_and_budget() -> None:
     assert isinstance(llm, LiteLLMAdapter)
     assert llm.ledger is ledger
     assert llm.daily_token_budget == 123
+
+
+def test_build_llm_passes_retries() -> None:
+    settings = Settings(
+        _env_file=None,
+        default_model="gpt-test",
+        openai_api_key="secret",
+        llm_max_retries=4,
+    )
+
+    llm = build_llm(settings)
+
+    assert isinstance(llm, LiteLLMAdapter)
+    assert llm.max_retries == 4
+
+
+def test_litellm_adapter_passes_retries() -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> SimpleNamespace:
+        captured.update(kwargs)
+        return make_response("ok")
+
+    adapter = LiteLLMAdapter(
+        "gpt-test",
+        completion_fn=fake_completion,
+        max_retries=3,
+    )
+
+    adapter.complete([{"role": "user", "content": "hi"}])
+
+    assert captured["num_retries"] == 3
+
+
+def test_litellm_adapter_rejects_negative_retries() -> None:
+    with pytest.raises(ValueError, match="max_retries"):
+        LiteLLMAdapter("gpt-test", max_retries=-1)
+
+
+def test_litellm_import_does_not_load_dotenv_from_cwd(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("PRIZM_LEAK_TEST=leaked\n", encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("LITELLM_MODE", None)
+    env.pop("PRIZM_LEAK_TEST", None)
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [src, env.get("PYTHONPATH")]))
+    code = (
+        "import os\n"
+        "from prizm.llm.adapter import LiteLLMAdapter\n"
+        "LiteLLMAdapter('gpt-test')._completion()\n"
+        "print(os.environ.get('PRIZM_LEAK_TEST', 'CLEAN'))\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "CLEAN"
 
 
 def test_build_llm_requires_provider_key(monkeypatch: pytest.MonkeyPatch) -> None:

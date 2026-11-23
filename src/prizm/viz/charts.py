@@ -12,7 +12,7 @@ from matplotlib import rcParams
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-# DEBT-022: 中文字体依赖系统已安装字体, 容器或精简环境可能缺字显示方框。
+# DEBT-022: 图表最多展示前 50 个点, 暂不支持多序列/面积图; 容器字体已内置。
 _FONT_CANDIDATES = (
     "Microsoft YaHei",
     "SimHei",

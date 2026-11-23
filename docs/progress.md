@@ -10,7 +10,7 @@
 ---
 
 ## 当前阶段
-P0 图表 + 结论链路已补齐；下一步真实模型评测与交付物
+MVP 交付物与真实模型评测已完成；剩余 50 题评测集、演示 GIF 与流式反馈
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -19,32 +19,36 @@ P0 图表 + 结论链路已补齐；下一步真实模型评测与交付物
 - 任务 1-2：LLM adapter（mock 默认 / litellm 切换）+ planner + orchestrator
 - 任务 1-3/1-4：Chainlit 上传→提问→SQL/结果；按 provider 取 key、显式 api_base
 - 任务 2-0/2-1/2-2：额度台账、P0 profiler、澄清门禁（异常场景召回 100%）
-- 任务 3-1/3-2：P1 自修复（总尝试 ≤3，还清 DEBT-001）、评测执行入口
+- 任务 3-1/3-2：P1 自修复（总尝试 ≤3）、评测执行入口
 - 任务 4-1：多轮上下文，数据集只加载一次并注入历史摘要
 - 任务 5-1/5-2：RAG 数据字典 + 50 条术语评测（引用溯源 50/50）
-- 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、各阶段记录、Chainlit 嵌套 Step + 侧栏面板
+- 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、Chainlit 嵌套 Step + 侧栏面板
 - 任务 7-1：Excel(.xlsx) / SQLite connector + 上传端多 sheet/多表选择
-- 任务 8-1：结构化 chart spec（bar/line/pie/scatter）+ matplotlib PNG + LLM 结论（模板兜底）；304 项 pytest 全绿
+- 任务 8-1：结构化 chart spec + matplotlib PNG + LLM 结论（模板兜底）
+- 任务 9-1：真实模型评测 70% 一次成功 / 90% 自修复后；SQLite 额度台账；litellm 不读 .env；README + Dockerfile（非 root/只读/CJK 字体）
 
 ## 进行中
 - 无
 
 ## 下一步
-- 真实模型评测：验证一次成功率 ≥75%、自修复后 ≥90%
-- 交付物：README（架构图/演示/评测表）与 Dockerfile 复核
+- 补约 50 题 × 3 数据集的完整评测集（DEBT-024）
+- 录制演示 GIF（DEBT-025）；补流式过程反馈（DEBT-020）
+- 账户限流恢复后复跑真实模型评测
 
 ## 阻塞与风险
-- 非阻塞：DEBT-023 LLM 结论未纳入评测，失败静默回退模板；DEBT-022 中文字体与 50 点上限
-- 非阻塞：DEBT-021 Excel/SQLite 仅单表整表读取；不支持 .xls、多表关联、视图与多级表头
-- 非阻塞：DEBT-020 透明面板为执行后一次性渲染，未提供流式过程反馈
+- 非阻塞：DEBT-024 评测集仅 10 题；DEBT-025 演示 GIF 未录制
+- 非阻塞：DEBT-023 LLM 结论未纳入评测，失败静默回退模板
+- 非阻塞：DEBT-022 图表 50 点上限、无多序列；字体已在 Docker 内置
+- 非阻塞：DEBT-021 Excel/SQLite 仅单表；DEBT-020 透明面板无流式反馈
 - 非阻塞：DEBT-019 RAG 评测集为模板生成；DEBT-016 路由启发式；DEBT-017 问答未用 LLM 归纳；DEBT-018 50 条 QA 评测待建
 - 非阻塞：DEBT-014 评测多轮未串上下文；DEBT-015 多轮记忆未缓存可查询结果
 - 非阻塞：DEBT-013 评测答案比对为启发式；DEBT-012 只读校验非完整 AST
 - 非阻塞：DEBT-009/010/011 澄清启发式与 LLM 判定回退；DEBT-007/008 主键与脏数值启发式
-- 非阻塞：DEBT-003 CSV 编码回退；DEBT-004 litellm .env 未隔离；DEBT-005 额度台账仅内存；DEBT-006 费用依赖 provider 字段
+- 非阻塞：DEBT-003 CSV 编码回退；DEBT-006 费用依赖 provider 字段
 
 ## 关键入口
 - 需求：docs/requirements.md ｜ 架构：docs/architecture.md
 - 技术债：docs/debts.md ｜ 待办：docs/backlog.md
-- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`）｜ 启动：`uv run chainlit run app/main.py`
-- 评测：`uv run python -m eval.run_eval`、`-m eval.run_clarify`、`-m eval.run_rag`
+- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 313 项）｜ 启动：`uv run chainlit run app/main.py`
+- 容器：`docker build -t prizm .` 后 `docker run --rm -p 8000:8000 --env-file .env -v prizm-data:/data prizm`
+- 评测：`uv run python -m eval.run_eval --execute`、`-m eval.run_clarify`、`-m eval.run_rag`

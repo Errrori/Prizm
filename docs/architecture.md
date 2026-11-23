@@ -38,7 +38,7 @@
 | 图表 | matplotlib（Agg）→ PNG，输入为 **chart spec** 而非代码 | 模板化渲染，避免任意绘图代码 |
 | 配置/密钥 | pydantic-settings + `.env`；key 只读 env / 会话内存 | 不落盘、不打日志 |
 | 测试/评测 | pytest（单测/集成）+ 独立 `eval/`（统计性，默认不进 CI） | 见第 6 节 |
-| 容器 | Dockerfile（非 root、禁网、只读挂载） | 兼作沙箱真隔离 |
+| 容器 | Dockerfile（非 root、`/data` 持久化、支持只读根文件系统；仅 LLM 需出网） | 兼作运行隔离；见 ADR-0008 |
 
 ## 3. 架构总览
 
@@ -129,6 +129,13 @@ flowchart TD
 - **代价**：真实模型多一次调用；结论质量尚未纳入评测，中文字体依赖系统字体（见 DEBT-022/023）。
 - **重估条件**：需要对外报告结论质量，或图表类型/多序列需求扩大时。
 
+### ADR-0008 部署：SQLite 用量台账 + 非 root 只读容器
+- **决策**：每日 token 台账用 stdlib `sqlite3` 持久化，路径由 `PRIZM_USAGE_LEDGER_PATH` 指定；Docker 基于 `python:3.11-slim` + `uv.lock` 安装，内建 Noto CJK 字体，非 root 运行，`/data` 持久化，支持 `--read-only --tmpfs /tmp`；litellm 强制 `LITELLM_MODE=PROD`、使用本地成本表。
+- **理由**：保留单机 demo 的低运维成本，同时解决重启清零与容器环境 `.env` 泄漏；镜像源可用 build args 覆盖，适配受限网络。
+- **被否**：继续内存台账——重启清零；引入 Redis/Postgres 台账——MVP 增加服务依赖；把 key 打进镜像——违反密钥不变量。
+- **代价**：跨主机多副本需共享 `/data` 卷；CJK 字体使镜像增大约 90MB；`--read-only` 需要额外 tmpfs。
+- **重估条件**：多主机/多租户部署，或需要按费用精确计量时。
+
 ## 6. 不变量（不可违背）
 
 - **密钥**：仅来自环境变量或会话输入，只存内存；不落盘、不打日志、不进仓库。
@@ -183,8 +190,8 @@ Prizm/
 
 - `prizm.datasource.base.BaseConnector`：`load() -> pd.DataFrame`（会话内缓存一次）、`view_name: str`、`register(engine)`；新增数据源继承并实现 `_read()`。CSV 实现在 `datasource/csv_connector.py`，视图名由 `sanitize_view_name` 清洗。Excel 实现在 `datasource/excel_connector.py`：`list_excel_sheets(path)` 列出工作表，`ExcelConnector(path, *, sheet_name=None)` 用 openpyxl 只读单个 `.xlsx` sheet。SQLite 实现在 `datasource/sqlite_connector.py`：`list_sqlite_tables(path)` 列出用户表（排除 `sqlite_*`），`SqliteConnector(path, *, table)` 用 stdlib `sqlite3` 以 `mode=ro` 读取单表；默认视图名为表名。
 - `prizm.engine.duckdb_engine.DuckDBEngine`：`register_dataframe(name, df)`、`execute(sql, max_rows=None) -> pd.DataFrame`、`close()`；构造参数 `memory_limit / threads / timeout_seconds`，内部执行只读校验并设 `enable_external_access=false`。`ensure_read_only_sql` 先由 DuckDB parser 判定为单条 `StatementType.SELECT`，再对去字符串/注释后的词法骨架拦截 CTE 内写操作与危险表函数。
-- `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> Completion(text, usage)`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings, *, response=None, ledger=None, daily_token_budget=None)` 按模型配置切换。真实模型按模型名判定 provider（qwen→dashscope / claude→anthropic / 其余→openai），只取对应 provider 的 key，缺 key 抛 `LLMConfigError`；`PRIZM_LLM_API_BASE` 显式作为 `api_base` 传给 litellm，不依赖其隐式读 `.env`。传入 `ledger` 时每次调用前检查额度、调用后记录 token/费用。
-- `prizm.utils.tokens`：`Usage(prompt_tokens, completion_tokens, total_tokens, cost_usd)`、`Completion(text, usage)`、`DailyUsageLedger`（按自然日累计，跨日清零，线程安全）、`SessionTurnCounter`（单会话次数限制，0 表示不限）、`QuotaExceededError`。
+- `prizm.llm.adapter`：协议 `LLMAdapter.complete(messages, temperature=0.0) -> Completion(text, usage)`；`MockLLM`（默认）与 `LiteLLMAdapter`（`litellm` 仅在此文件内），`build_llm(settings, *, response=None, ledger=None, daily_token_budget=None)` 按模型配置切换。真实模型按模型名判定 provider（qwen→dashscope / claude→anthropic / 其余→openai），只取对应 provider 的 key，缺 key 抛 `LLMConfigError`；`PRIZM_LLM_API_BASE` 显式作为 `api_base` 传给 litellm，不依赖其隐式读 `.env`；import 前强制 `LITELLM_MODE=PROD` 与本地成本表，`max_retries` 透传 `num_retries` 处理限流/抖动。传入 `ledger` 时每次调用前检查额度、调用后记录 token/费用。
+- `prizm.utils.tokens`：`Usage(prompt_tokens, completion_tokens, total_tokens, cost_usd)`、`Completion(text, usage)`、`UsageLedger` 协议、`DailyUsageLedger`（进程内，线程安全）、`SqliteUsageLedger(path)`（按自然日 upsert，重启与同机多进程共享）、`SessionTurnCounter`（单会话次数限制，0 表示不限）、`QuotaExceededError`。
 - `prizm.agent.clarify`：`ClarifyGate.judge(question, profile) -> ClarifyDecision(requests)` 在规划前判定是否反问；异常按类型分组（完全重复/主键重复/缺失/脏数值），仅当问题命中受影响列或聚合类词时才问；`confirm(code, choice, question=None)` 记录会话级口径，`policy_summary()` 供 planner 注入；问题模糊时可用 `LLMAmbiguityJudge` 按 JSON 判定，判定失败回退关键词启发式；`parse_ambiguity_response` 负责校验模型输出。
 - `prizm.agent.memory.ConversationMemory(max_turns=5, prompt_max_chars=2000)`：保存最近轮次 `Turn(question, sql, columns, row_count, preview, chart)`，`add / clear / turns / format_for_prompt`；只注入问题、SQL、列、行数与前几行摘要，超长时优先保留最新轮次，不注入全量数据。
 - `prizm.agent.trace`：`TraceStep(name, status, summary, detail)`、`ProfileReference(code, column, count, reason)`、`Trace(question, steps, generated_sql, execution_status, profile_references, confirmed_policies, attempts, elapsed_ms)`；`to_panel_markdown()` 渲染“执行状态 + 生成 SQL + 引用体检结论 + 已确认口径 + 步骤时间线”。只保存摘要与引用，不保存全量数据、样本行或密钥。
@@ -199,4 +206,5 @@ Prizm/
 - `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `eval/run_rag.py`：读取 `eval/rag_tasks.jsonl` 的 50 条术语问法，按数据集生成数据字典，校验 `is_dictionary_question` 路由与 top-1 引用字段是否命中期望列，输出引用溯源准确率（目标 ≥90%）；当前模板集 50/50。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
-- 入口 `app/main.py`：Chainlit 上传 CSV / Excel(.xlsx) / SQLite（可选同时上传 .md/.txt 数据说明）→ 注册 DuckDB → 生成并展示体检报告与数据字典 → 提问；Excel 多工作表或 SQLite 多表时用动作消息让用户选一个；术语问题走 RAG 展示带出处的字典片段，分析问题展示结论 + 图表（`cl.Image`）+ SQL + 结果；真实模型模式挂载 `ConclusionComposer`，mock 模式用模板结论；按 `Trace` 渲染嵌套 Step 时间线，并用侧栏 `cl.Text` 展示透明面板（执行状态、生成 SQL、引用体检结论、已确认口径、图表/结论/尝试/修复记录）；`RepairFailed` 时展示最终错误与失败面板；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。
+- 入口 `app/main.py`：Chainlit 上传 CSV / Excel(.xlsx) / SQLite（可选同时上传 .md/.txt 数据说明）→ 注册 DuckDB → 生成并展示体检报告与数据字典 → 提问；Excel 多工作表或 SQLite 多表时用动作消息让用户选一个；术语问题走 RAG 展示带出处的字典片段，分析问题展示结论 + 图表（`cl.Image`）+ SQL + 结果；真实模型模式挂载 `ConclusionComposer`，mock 模式用模板结论；用量台账按 `PRIZM_USAGE_LEDGER_PATH` 落 SQLite；按 `Trace` 渲染嵌套 Step 时间线，并用侧栏 `cl.Text` 展示透明面板（执行状态、生成 SQL、引用体检结论、已确认口径、图表/结论/尝试/修复记录）；`RepairFailed` 时展示最终错误与失败面板；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。
+- 交付：`Dockerfile` 基于 `python:3.11-slim` + `uv.lock`，安装 Noto CJK 字体，非 root（uid 10001）、`/data` 持久化、`CHAINLIT_APP_ROOT=/data`，支持只读根文件系统；`README.md` 含架构图、快速开始、安全说明与最小评测结果。

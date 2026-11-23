@@ -7,6 +7,7 @@ from prizm.utils.tokens import (
     DailyUsageLedger,
     QuotaExceededError,
     SessionTurnCounter,
+    SqliteUsageLedger,
     Usage,
 )
 
@@ -104,3 +105,55 @@ def test_session_turn_counter_zero_means_unlimited() -> None:
 def test_session_turn_counter_rejects_invalid_limit(limit: object) -> None:
     with pytest.raises(ValueError, match="limit"):
         SessionTurnCounter(limit)  # type: ignore[arg-type]
+
+def test_sqlite_ledger_persists_across_instances(tmp_path) -> None:
+    path = tmp_path / "usage.sqlite3"
+    first = SqliteUsageLedger(path)
+    first.record(Usage(prompt_tokens=10, completion_tokens=5))
+
+    second = SqliteUsageLedger(path)
+
+    assert second.snapshot() == Usage(
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+        cost_usd=None,
+    )
+
+
+def test_sqlite_ledger_resets_on_new_day(tmp_path) -> None:
+    clock = FakeClock(date(2026, 1, 1))
+    ledger = SqliteUsageLedger(tmp_path / "usage.sqlite3", today=clock)
+    ledger.record(Usage(total_tokens=50))
+
+    clock.advance(1)
+
+    assert ledger.snapshot().total_tokens == 0
+    assert ledger.day == date(2026, 1, 2)
+    ledger.record(Usage(total_tokens=20))
+    assert ledger.snapshot().total_tokens == 20
+
+
+def test_sqlite_ledger_accumulates_cost_with_none(tmp_path) -> None:
+    ledger = SqliteUsageLedger(tmp_path / "usage.sqlite3")
+    ledger.record(Usage(cost_usd=0.5))
+    ledger.record(Usage(cost_usd=0.25))
+
+    assert ledger.snapshot().cost_usd == 0.75
+    ledger.record(Usage())
+    assert ledger.snapshot().cost_usd == 0.75
+
+
+def test_sqlite_ledger_blocks_when_budget_exhausted(tmp_path) -> None:
+    ledger = SqliteUsageLedger(tmp_path / "usage.sqlite3")
+    ledger.record(Usage(total_tokens=100))
+
+    with pytest.raises(QuotaExceededError, match="额度已用完"):
+        ledger.ensure_available(100)
+
+
+def test_sqlite_ledger_rejects_invalid_budget(tmp_path) -> None:
+    ledger = SqliteUsageLedger(tmp_path / "usage.sqlite3")
+
+    with pytest.raises(ValueError, match="budget"):
+        ledger.remaining(-1)

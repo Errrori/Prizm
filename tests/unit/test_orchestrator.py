@@ -16,6 +16,8 @@ from prizm.agent.planner import Planner
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
 from prizm.llm.adapter import Completion, Message, MockLLM
+from prizm.rag.ingest import DictionaryEntry
+from prizm.rag.retriever import DataDictionaryRetriever, DictionaryAnswer, DictionaryQA
 
 
 class CountingConnector(CsvConnector):
@@ -110,6 +112,65 @@ def test_orchestrator_repairs_after_sql_error(tmp_path: Path) -> None:
     assert "missing_column" in answer.repair_history[0].error
     assert int(answer.dataframe.loc[0, "total"]) == 300
     assert "上一次尝试失败" in llm.calls[1][1]["content"]
+
+
+def test_orchestrator_reuses_dataset_and_injects_history(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    llm = SequenceLLM(
+        [
+            json.dumps({"sql": sql, "chart": None}),
+            json.dumps({"sql": sql, "chart": None}),
+        ]
+    )
+    connector = CountingConnector(path)
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(connector, engine, Planner(llm))
+        orchestrator.ask("已完成订单的销售额是多少？")
+        orchestrator.ask("只看已完成的再算一次。")
+
+    assert connector.read_count == 1
+    assert len(orchestrator.history) == 2
+    assert orchestrator.history[0].question == "已完成订单的销售额是多少？"
+    assert orchestrator.history[0].sql == sql
+    assert orchestrator.history[1].question == "只看已完成的再算一次。"
+
+    second_prompt = llm.calls[1][1]["content"]
+    assert "最近对话与结果" in second_prompt
+    assert "已完成订单的销售额是多少？" in second_prompt
+    assert sql in second_prompt
+
+
+def test_orchestrator_routes_dictionary_questions_without_calling_llm(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    llm = MockLLM(json.dumps({"sql": "SELECT 1 AS ok", "chart": None}))
+    qa = DictionaryQA(
+        DataDictionaryRetriever(
+            [
+                DictionaryEntry(
+                    id="orders.csv:column:sales",
+                    text="字段 sales：销售额，数值型。",
+                    source="orders.csv",
+                    column="sales",
+                )
+            ]
+        )
+    )
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm), dictionary_qa=qa)
+        dictionary_answer = orchestrator.ask("sales 是什么意思？")
+        analysis_answer = orchestrator.ask("已完成订单的销售额是多少？")
+
+    assert isinstance(dictionary_answer, DictionaryAnswer)
+    assert dictionary_answer.citations[0].column == "sales"
+    assert llm.calls[0][1]["content"].endswith("已完成订单的销售额是多少？")
+    assert len(llm.calls) == 1
+    assert isinstance(analysis_answer, Answer)
+    assert len(orchestrator.history) == 1
 
 
 def test_orchestrator_builds_profile_and_injects_summary(tmp_path: Path) -> None:

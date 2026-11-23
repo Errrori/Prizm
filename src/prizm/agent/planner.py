@@ -22,6 +22,7 @@ JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 - 只能使用给定 schema 中存在的列，不要臆造列名。
 - 标识符必要时用双引号包裹。
 - 体检摘要中的异常仅作上下文提示，不要据此臆造数据或擅自改变统计口径。
+- 若提供了最近对话与结果，结合上一轮问题和 SQL 理解“上一题/再算一次”等指代。
 - 若提供了用户已确认的数据口径，必须严格遵循，不得自行更改。
 - 若提供了上次失败信息，必须针对错误修正 SQL，不要重复同样的错误。
 - 本阶段不绘图，chart 必须为 null。"""
@@ -55,6 +56,7 @@ def build_plan_prompt(
     sample_rows: int = 5,
     profile_summary: str | None = None,
     confirmed_policies: Mapping[str, str] | None = None,
+    conversation_summary: str | None = None,
     repair_feedback: str | None = None,
 ) -> list[Message]:
     """构造规划 prompt：只注入 schema + 体检摘要或前若干行样本，绝不注入全量数据。"""
@@ -70,6 +72,8 @@ def build_plan_prompt(
     if confirmed_policies:
         policies = "\n".join(f"- {name}：{choice}" for name, choice in confirmed_policies.items())
         context += f"\n\n用户已确认的数据口径（必须遵守）：\n{policies}"
+    if conversation_summary:
+        context += f"\n\n最近对话与结果（用于理解指代，不要臆造）：\n{conversation_summary}"
     if repair_feedback:
         context += f"\n\n上一次尝试失败，需要修复：\n{repair_feedback}"
     user_prompt = f"数据集视图：{view_name}\n{context}\n问题：{question}"
@@ -117,6 +121,7 @@ class Planner:
         *,
         profile_summary: str | None = None,
         confirmed_policies: Mapping[str, str] | None = None,
+        conversation_summary: str | None = None,
         repair_feedback: str | None = None,
     ) -> Plan:
         if not question.strip():
@@ -128,6 +133,7 @@ class Planner:
             sample_rows=self.sample_rows,
             profile_summary=profile_summary,
             confirmed_policies=confirmed_policies,
+            conversation_summary=conversation_summary,
             repair_feedback=repair_feedback,
         )
         return parse_plan(self.llm.complete(messages).text)

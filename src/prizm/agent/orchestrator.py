@@ -9,12 +9,16 @@ from typing import Any, cast
 import pandas as pd
 
 from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
+from prizm.agent.memory import ConversationMemory, Turn
 from prizm.agent.planner import Planner
 from prizm.agent.repair import RepairAttempt, Repairer
 from prizm.datasource.base import BaseConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
 from prizm.profiling.models import ProfileReport
 from prizm.profiling.profiler import ProfileOptions, profile_frame
+from prizm.rag.retriever import DictionaryAnswer, DictionaryQA, is_dictionary_question
+
+_HISTORY_PREVIEW_ROWS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +69,7 @@ class _PendingClarification:
 
 
 class Orchestrator:
-    """单数据集、单轮问答；上传后立即体检，提问时先过澄清门禁。"""
+    """单数据集、多轮问答；上传后立即体检，提问时先过澄清门禁。"""
 
     def __init__(
         self,
@@ -77,11 +81,15 @@ class Orchestrator:
         primary_key: str | Sequence[str] | None = None,
         clarify_gate: ClarifyGate | None = None,
         repairer: Repairer | None = None,
+        memory: ConversationMemory | None = None,
+        dictionary_qa: DictionaryQA | None = None,
     ) -> None:
         self._frame = connector.load()
         self._engine = engine
         self._planner = planner
         self._repairer = repairer or Repairer(planner, engine)
+        self._memory = memory or ConversationMemory()
+        self._dictionary_qa = dictionary_qa
         self._profile_options = profile_options or ProfileOptions()
         self._profile = profile_frame(
             self._frame,
@@ -102,17 +110,28 @@ class Orchestrator:
         return self._profile
 
     @property
+    def history(self) -> tuple[Turn, ...]:
+        return self._memory.turns
+
+    def attach_dictionary(self, dictionary_qa: DictionaryQA | None) -> None:
+        """挂载/替换数据字典问答；None 表示关闭 RAG 路由。"""
+        self._dictionary_qa = dictionary_qa
+
+    @property
     def pending_clarification(self) -> Clarification | None:
         if self._pending is None:
             return None
         return self._as_clarification(self._pending)
 
-    def ask(self, question: str) -> Answer | Clarification:
+    def ask(self, question: str) -> Answer | Clarification | DictionaryAnswer:
         if not question.strip():
             raise ValueError("问题不能为空")
         if self._pending is not None:
             raise RuntimeError("存在未完成的澄清，请先回答澄清问题")
-        return self._advance(question.strip())
+        text = question.strip()
+        if self._dictionary_qa is not None and is_dictionary_question(text):
+            return self._dictionary_qa.answer(text)
+        return self._advance(text)
 
     def resolve(self, value: str) -> Answer | Clarification:
         """记录用户对当前澄清项的回复；全部澄清完成后重跑原问题。"""
@@ -148,8 +167,9 @@ class Orchestrator:
                 max_chars=self._profile_options.max_prompt_chars
             ),
             confirmed_policies=policies or None,
+            conversation_summary=self._memory.format_for_prompt(),
         )
-        return Answer(
+        answer = Answer(
             question=question,
             sql=outcome.plan.sql,
             dataframe=outcome.dataframe,
@@ -157,6 +177,22 @@ class Orchestrator:
             attempts=outcome.attempts,
             repair_history=outcome.history,
         )
+        self._memory.add(
+            Turn(
+                question=question,
+                sql=answer.sql,
+                columns=tuple(str(column) for column in answer.dataframe.columns),
+                row_count=len(answer.dataframe),
+                preview=tuple(
+                    {str(key): value for key, value in row.items()}
+                    for row in answer.dataframe.head(_HISTORY_PREVIEW_ROWS).to_dict(
+                        orient="records"
+                    )
+                ),
+                chart=answer.chart,
+            )
+        )
+        return answer
 
     @staticmethod
     def _as_clarification(pending: _PendingClarification) -> Clarification:

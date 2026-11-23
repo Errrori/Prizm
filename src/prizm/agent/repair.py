@@ -93,6 +93,7 @@ class Repairer:
         *,
         profile_summary: str | None = None,
         confirmed_policies: Mapping[str, str] | None = None,
+        conversation_summary: str | None = None,
     ) -> RepairResult:
         history: list[RepairAttempt] = []
         feedback: str | None = None
@@ -107,6 +108,7 @@ class Repairer:
                     frame,
                     profile_summary=profile_summary,
                     confirmed_policies=confirmed_policies,
+                    conversation_summary=conversation_summary,
                     repair_feedback=feedback,
                 )
                 dataframe = self.engine.execute(plan.sql)

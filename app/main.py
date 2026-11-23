@@ -21,6 +21,8 @@ from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMError, build_llm
 from prizm.profiling.profiler import format_profile_report
+from prizm.rag.ingest import DictionaryEntry, build_data_dictionary, load_dictionary_file
+from prizm.rag.retriever import DataDictionaryRetriever, DictionaryAnswer, DictionaryQA
 from prizm.utils.tokens import DailyUsageLedger, QuotaExceededError, SessionTurnCounter
 
 _usage_ledger = DailyUsageLedger()
@@ -30,19 +32,41 @@ _usage_ledger = DailyUsageLedger()
 async def on_chat_start() -> None:
     settings = get_settings()
     files = await cl.AskFileMessage(
-        content="请上传一个 CSV 文件（阶段 1 仅支持 CSV）。",
-        accept=["text/csv"],
-        max_files=1,
+        content="请上传一个 CSV 文件，可选同时上传 .md/.txt 数据说明文档。",
+        accept=["text/csv", "text/markdown", "text/plain"],
+        max_files=2,
         max_size_mb=50,
     ).send()
     if not files:
         await cl.Message(content="未收到文件，已取消。").send()
         return
 
-    uploaded = files[0]
-    if uploaded.path is None:
-        await cl.Message(content="文件尚未落地到本地，无法读取。").send()
+    csv_files = [file for file in files if file.name.lower().endswith(".csv")]
+    if len(csv_files) != 1:
+        await cl.Message(content="请上传且只上传一个 CSV 文件。").send()
         return
+    uploaded = csv_files[0]
+    if uploaded.path is None:
+        await cl.Message(content="CSV 文件尚未落地到本地，无法读取。").send()
+        return
+
+    doc_files = [
+        file for file in files if file.name.lower().endswith((".md", ".txt"))
+    ]
+    if len(doc_files) > 1:
+        await cl.Message(content="最多上传一个数据说明文档。").send()
+        return
+    doc_entries: tuple[DictionaryEntry, ...] = ()
+    if doc_files:
+        doc_file = doc_files[0]
+        if doc_file.path is None:
+            await cl.Message(content="数据说明文档尚未落地到本地，无法读取。").send()
+            return
+        try:
+            doc_entries = load_dictionary_file(doc_file.path, source=doc_file.name)
+        except (OSError, ValueError) as exc:
+            await cl.Message(content=f"读取数据说明文档失败：{exc}").send()
+            return
 
     try:
         connector = CsvConnector(uploaded.path, view_name=uploaded.name)
@@ -67,6 +91,13 @@ async def on_chat_start() -> None:
         Planner(llm),
         clarify_gate=ClarifyGate(ambiguity_judge=ambiguity_judge),
     )
+    generated_entries = build_data_dictionary(
+        orchestrator.dataframe,
+        profile=orchestrator.profile,
+        source=uploaded.name,
+    )
+    dictionary_entries = (*generated_entries, *doc_entries)
+    orchestrator.attach_dictionary(DictionaryQA(DataDictionaryRetriever(dictionary_entries)))
     cl.user_session.set("orchestrator", orchestrator)
     cl.user_session.set("turns", SessionTurnCounter(settings.session_turn_limit))
 
@@ -75,7 +106,9 @@ async def on_chat_start() -> None:
     await cl.Message(
         content=(
             f"已加载 `{uploaded.name}`：{len(frame)} 行 × {len(frame.columns)} 列。\n"
-            f"当前模型：{mode}。\n\n"
+            f"当前模型：{mode}。\n"
+            f"数据字典：{len(dictionary_entries)} 条"
+            f"（文档 {len(doc_entries)} 条）。\n\n"
             f"{format_profile_report(orchestrator.profile)}"
         )
     ).send()
@@ -99,7 +132,7 @@ async def on_message(message: cl.Message) -> None:
         ).send()
         return
 
-    result: Answer | Clarification
+    result: Answer | Clarification | DictionaryAnswer
     try:
         async with cl.Step(name="澄清判定与规划", type="tool") as step:
             step.input = message.content
@@ -142,6 +175,10 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content=f"分析失败：{exc}").send()
         return
 
+    if isinstance(result, DictionaryAnswer):
+        await cl.Message(content=result.text).send()
+        return
+
     assert isinstance(result, Answer)
     await cl.Message(
         content=(
@@ -153,9 +190,11 @@ async def on_message(message: cl.Message) -> None:
     ).send()
 
 
-def _step_output(result: Answer | Clarification) -> str:
+def _step_output(result: Answer | Clarification | DictionaryAnswer) -> str:
     if isinstance(result, Clarification):
         return result.request.question
+    if isinstance(result, DictionaryAnswer):
+        return result.text
     output = result.sql
     if result.repaired:
         output += f"\n（第 {result.attempts} 次尝试成功）"

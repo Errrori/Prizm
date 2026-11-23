@@ -93,6 +93,34 @@ def test_planner_passes_repair_feedback_to_llm() -> None:
     assert "上次 SQL 缺列" in llm.calls[0][1]["content"]
 
 
+def test_prompt_injects_conversation_summary() -> None:
+    frame = pd.DataFrame({"sales": [1, 2]})
+    summary = "第 1 轮问题：销售额\n生成的 SQL：SELECT SUM(sales) FROM orders"
+
+    messages = build_plan_prompt(
+        "只看已完成的再算一次",
+        "orders",
+        frame,
+        profile_summary="数据体检：2 行 × 1 列",
+        conversation_summary=summary,
+    )
+    user_content = messages[1]["content"]
+
+    assert "最近对话与结果" in user_content
+    assert summary in user_content
+    assert "只看已完成的再算一次" in user_content
+
+
+def test_planner_passes_conversation_summary_to_llm() -> None:
+    frame = pd.DataFrame({"sales": [1, 2]})
+    llm = MockLLM(json.dumps({"sql": "SELECT 1", "chart": None}))
+    planner = Planner(llm)
+
+    planner.plan("再算一次", "orders", frame, conversation_summary="上一轮 SQL：SELECT 1")
+
+    assert "上一轮 SQL：SELECT 1" in llm.calls[0][1]["content"]
+
+
 def test_parse_plan_accepts_fenced_json() -> None:
     text = '```json\n{"sql": "SELECT 1", "chart": null}\n```'
 

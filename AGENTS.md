@@ -45,7 +45,7 @@
 
     - 未做的功能想法 → docs/backlog.md
 
-8. 测试验收通过后 git commit，commit message 用中文一句话说清改了什么
+8. 测试验收通过后自动提交到GitHub，commit message 用中文一句话说清改了什么
 
     
 

@@ -47,6 +47,7 @@ from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMAdapter, LLMError, build_llm
+from prizm.rag.retriever import DictionaryAnswer
 from prizm.utils.tokens import DailyUsageLedger
 
 DEFAULT_TASKS_PATH = Path("eval/tasks.jsonl")
@@ -268,6 +269,17 @@ def execute_task(
             error="" if passed else "未预期的澄清",
         )
 
+    if isinstance(result, DictionaryAnswer):
+        return TaskOutcome(
+            task_id=task.id,
+            category=task.category,
+            first_pass_ok=False,
+            final_ok=False,
+            expected_clarification=task.expects_clarification,
+            attempts=1,
+            error="误走数据字典问答",
+        )
+
     final_ok = matches_expected(result.dataframe, task.expected)
     return TaskOutcome(
         task_id=task.id,
@@ -281,6 +293,7 @@ def execute_task(
     )
 
 
+# DEBT-014: 多轮任务仍按单题执行, 未串接上一轮上下文。
 def execute_tasks(
     tasks: Sequence[EvalTask],
     datasets_dir: Path,

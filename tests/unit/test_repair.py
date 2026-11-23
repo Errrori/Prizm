@@ -126,6 +126,28 @@ def test_repairer_retries_after_query_timeout() -> None:
     assert int(result.dataframe.loc[0, "ok"]) == 2
 
 
+def test_repairer_keeps_conversation_summary_on_every_attempt() -> None:
+    llm = ScriptedLLM(
+        [
+            plan("SELECT missing_column FROM orders"),
+            plan("SELECT 1 AS ok"),
+        ]
+    )
+    data = frame()
+
+    with DuckDBEngine() as engine:
+        engine.register_dataframe("orders", data)
+        Repairer(Planner(llm), engine).run(
+            "再算一次",
+            "orders",
+            data,
+            conversation_summary="上一轮 SQL：SELECT 1",
+        )
+
+    assert "上一轮 SQL：SELECT 1" in llm.calls[0][1]["content"]
+    assert "上一轮 SQL：SELECT 1" in llm.calls[1][1]["content"]
+
+
 def test_repairer_retries_after_plan_parse_error() -> None:
     llm = ScriptedLLM(["不是 JSON", plan("SELECT 1 AS ok")])
     data = frame()

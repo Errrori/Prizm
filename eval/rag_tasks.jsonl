@@ -1,0 +1,50 @@
+{"id":"rag-001","dataset":"orders.csv","question":"order_id 是什么意思？","expected_columns":["order_id"]}
+{"id":"rag-002","dataset":"orders.csv","question":"order_id 字段的含义是什么？","expected_columns":["order_id"]}
+{"id":"rag-003","dataset":"orders.csv","question":"order_id 代表什么？","expected_columns":["order_id"]}
+{"id":"rag-004","dataset":"orders.csv","question":"解释一下 order_id 字段。","expected_columns":["order_id"]}
+{"id":"rag-005","dataset":"orders.csv","question":"order_id 列的取值有哪些？","expected_columns":["order_id"]}
+{"id":"rag-006","dataset":"orders.csv","question":"order_date 是什么意思？","expected_columns":["order_date"]}
+{"id":"rag-007","dataset":"orders.csv","question":"order_date 字段的含义是什么？","expected_columns":["order_date"]}
+{"id":"rag-008","dataset":"orders.csv","question":"order_date 代表什么？","expected_columns":["order_date"]}
+{"id":"rag-009","dataset":"orders.csv","question":"解释一下 order_date 字段。","expected_columns":["order_date"]}
+{"id":"rag-010","dataset":"orders.csv","question":"order_date 列的取值有哪些？","expected_columns":["order_date"]}
+{"id":"rag-011","dataset":"orders.csv","question":"channel 是什么意思？","expected_columns":["channel"]}
+{"id":"rag-012","dataset":"orders.csv","question":"channel 字段的含义是什么？","expected_columns":["channel"]}
+{"id":"rag-013","dataset":"orders.csv","question":"channel 代表什么？","expected_columns":["channel"]}
+{"id":"rag-014","dataset":"orders.csv","question":"解释一下 channel 字段。","expected_columns":["channel"]}
+{"id":"rag-015","dataset":"orders.csv","question":"channel 列的取值有哪些？","expected_columns":["channel"]}
+{"id":"rag-016","dataset":"orders.csv","question":"region 是什么意思？","expected_columns":["region"]}
+{"id":"rag-017","dataset":"orders.csv","question":"region 字段的含义是什么？","expected_columns":["region"]}
+{"id":"rag-018","dataset":"orders.csv","question":"region 代表什么？","expected_columns":["region"]}
+{"id":"rag-019","dataset":"orders.csv","question":"解释一下 region 字段。","expected_columns":["region"]}
+{"id":"rag-020","dataset":"orders.csv","question":"region 列的取值有哪些？","expected_columns":["region"]}
+{"id":"rag-021","dataset":"orders.csv","question":"product 是什么意思？","expected_columns":["product"]}
+{"id":"rag-022","dataset":"orders.csv","question":"product 字段的含义是什么？","expected_columns":["product"]}
+{"id":"rag-023","dataset":"orders.csv","question":"product 代表什么？","expected_columns":["product"]}
+{"id":"rag-024","dataset":"orders.csv","question":"解释一下 product 字段。","expected_columns":["product"]}
+{"id":"rag-025","dataset":"orders.csv","question":"product 列的取值有哪些？","expected_columns":["product"]}
+{"id":"rag-026","dataset":"orders.csv","question":"status 是什么意思？","expected_columns":["status"]}
+{"id":"rag-027","dataset":"orders.csv","question":"status 字段的含义是什么？","expected_columns":["status"]}
+{"id":"rag-028","dataset":"orders.csv","question":"status 代表什么？","expected_columns":["status"]}
+{"id":"rag-029","dataset":"orders.csv","question":"解释一下 status 字段。","expected_columns":["status"]}
+{"id":"rag-030","dataset":"orders.csv","question":"status 列的取值有哪些？","expected_columns":["status"]}
+{"id":"rag-031","dataset":"orders.csv","question":"quantity 是什么意思？","expected_columns":["quantity"]}
+{"id":"rag-032","dataset":"orders.csv","question":"quantity 字段的含义是什么？","expected_columns":["quantity"]}
+{"id":"rag-033","dataset":"orders.csv","question":"quantity 代表什么？","expected_columns":["quantity"]}
+{"id":"rag-034","dataset":"orders.csv","question":"解释一下 quantity 字段。","expected_columns":["quantity"]}
+{"id":"rag-035","dataset":"orders.csv","question":"quantity 列的取值有哪些？","expected_columns":["quantity"]}
+{"id":"rag-036","dataset":"orders.csv","question":"unit_price 是什么意思？","expected_columns":["unit_price"]}
+{"id":"rag-037","dataset":"orders.csv","question":"unit_price 字段的含义是什么？","expected_columns":["unit_price"]}
+{"id":"rag-038","dataset":"orders.csv","question":"unit_price 代表什么？","expected_columns":["unit_price"]}
+{"id":"rag-039","dataset":"orders.csv","question":"解释一下 unit_price 字段。","expected_columns":["unit_price"]}
+{"id":"rag-040","dataset":"orders.csv","question":"unit_price 列的取值有哪些？","expected_columns":["unit_price"]}
+{"id":"rag-041","dataset":"orders.csv","question":"sales 是什么意思？","expected_columns":["sales"]}
+{"id":"rag-042","dataset":"orders.csv","question":"sales 字段的含义是什么？","expected_columns":["sales"]}
+{"id":"rag-043","dataset":"orders.csv","question":"sales 代表什么？","expected_columns":["sales"]}
+{"id":"rag-044","dataset":"orders.csv","question":"解释一下 sales 字段。","expected_columns":["sales"]}
+{"id":"rag-045","dataset":"orders.csv","question":"sales 列的取值有哪些？","expected_columns":["sales"]}
+{"id":"rag-046","dataset":"orders.csv","question":"请解释一下 order_id 字段的用途。","expected_columns":["order_id"]}
+{"id":"rag-047","dataset":"orders.csv","question":"请解释一下 order_date 字段的用途。","expected_columns":["order_date"]}
+{"id":"rag-048","dataset":"orders.csv","question":"请解释一下 channel 字段的用途。","expected_columns":["channel"]}
+{"id":"rag-049","dataset":"orders.csv","question":"请解释一下 region 字段的用途。","expected_columns":["region"]}
+{"id":"rag-050","dataset":"orders.csv","question":"请解释一下 product 字段的用途。","expected_columns":["product"]}

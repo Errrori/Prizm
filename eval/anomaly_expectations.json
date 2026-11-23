@@ -1,0 +1,20 @@
+{
+  "orders_dirty.csv": [
+    "exact_duplicate_rows",
+    "duplicate_primary_key",
+    "dirty_numeric_format",
+    "missing_values"
+  ],
+  "monthly_sales_dirty.csv": [
+    "exact_duplicate_rows",
+    "duplicate_primary_key",
+    "dirty_numeric_format",
+    "missing_values"
+  ],
+  "channel_traffic_dirty.csv": [
+    "exact_duplicate_rows",
+    "duplicate_primary_key",
+    "dirty_numeric_format",
+    "missing_values"
+  ]
+}

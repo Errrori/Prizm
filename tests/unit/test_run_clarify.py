@@ -20,8 +20,8 @@ def test_actual_tasks_meet_clarification_targets() -> None:
     report, passed = format_report(evaluate(tasks, DEFAULT_DATASETS_DIR))
 
     assert passed is True
-    assert "3/3 = 100.0%" in report
-    assert "10/10 = 100.0%" in report
+    assert "12/12 = 100.0%" in report
+    assert "150/150 = 100.0%" in report
 
 
 def test_mismatch_is_reported_and_fails() -> None:

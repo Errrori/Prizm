@@ -8,6 +8,7 @@
 - ``question``：自然语言问题。
 - ``expected``：标准答案，必须是 JSON 可序列化值。
 - ``expects_clarification``：是否应触发澄清，默认 ``False``。
+- ``session``：可选多轮会话标识；同标识的任务按文件顺序复用同一会话上下文。
 
 ``eval/run_eval.py`` 逐题执行后产出 :class:`TaskOutcome`，再交给本模块计算指标。
 """
@@ -51,6 +52,7 @@ class EvalTask:
     question: str
     expected: Any
     expects_clarification: bool = False
+    session: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +125,10 @@ def parse_task(raw: Mapping[str, Any]) -> EvalTask:
     if not isinstance(expects_clarification, bool):
         raise ValueError("expects_clarification 必须是 bool")
 
+    session = raw.get("session")
+    if session is not None:
+        session = _require_non_empty_str(session, "session")
+
     return EvalTask(
         id=_require_non_empty_str(raw["id"], "id"),
         category=category,
@@ -130,6 +136,7 @@ def parse_task(raw: Mapping[str, Any]) -> EvalTask:
         question=_require_non_empty_str(raw["question"], "question"),
         expected=raw["expected"],
         expects_clarification=expects_clarification,
+        session=session,
     )
 
 

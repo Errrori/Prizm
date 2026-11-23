@@ -148,7 +148,7 @@ flowchart TD
 
 | 需求 | 承载模块 |
 |---|---|
-| P0 数据体检 | `profiling/`（自研，埋雷集检出率 100% 由单测保障） |
+| P0 数据体检 | `profiling/`（自研；`eval/anomaly_expectations.json` + `run_eval` 校验埋雷集检出率 100%） |
 | P0 对话式分析 | `agent/orchestrator` + `agent/planner` + `engine/duckdb` + `viz/charts` + `agent/composer` |
 | P0 澄清机制 | `agent/clarify`（该问就问 / 不该问不问） |
 | P1 自修复 | `agent/repair`（≤3 次） |
@@ -182,7 +182,7 @@ Prizm/
 │  ├─ viz/charts.py          # chart spec → matplotlib PNG
 │  └─ utils/                 # logging / tokens（额度）
 ├─ tests/{unit,integration,fixtures}
-├─ eval/{datasets,run_eval.py,run_clarify.py,run_rag.py,rag_tasks.jsonl,metrics.py}
+├─ eval/{datasets,build_tasks.py,run_eval.py,run_clarify.py,run_rag.py,anomaly_expectations.json,tasks.jsonl,rag_tasks.jsonl,metrics.py}
 └─ scripts/gen_data_dict.py
 ```
 
@@ -202,7 +202,8 @@ Prizm/
 - `prizm.agent.composer`：`Conclusion(text, source, fallback_reason)`、`template_conclusion(frame)`、`ConclusionComposer(llm).compose(question, sql, frame, chart=None) -> Conclusion`；prompt 只注入结果规模与前 10 行样本，LLM 失败/额度不足/空输出回退模板文本。
 - `prizm.agent.repair.Repairer(planner, engine, max_attempts=3).run(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, conversation_summary=None) -> RepairResult(plan, dataframe, attempts, history)`：总尝试不超过 3 次（含首次）；解析/校验/执行/超时错误回传错误类型与消息并重新规划，重试时保留多轮摘要；LLM 调用失败与额度超限不重试；耗尽抛 `RepairFailed(question, attempts, last_error, history)`。`format_repair_error` 不回传本机 traceback。
 - `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None, repairer=None, memory=None, conclusion_composer=None).ask(question) -> Answer | Clarification | DictionaryAnswer`；构造时自动体检一次并只加载一次数据，`profile` 属性暴露 `ProfileReport`；每轮成功后在 `memory` 记录 `Turn` 并供下一轮 planner 注入，`history` 暴露最近轮次；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后复核并重跑原问题、注入口径；执行经 `Repairer`，再经 `viz.charts` 校验并渲染 `chart_png`（失败只标记 trace，不改表格结果），最后按 `conclusion_composer` 生成结论（未配置时用模板）；`Answer` 暴露 `chart / chart_png / conclusion / conclusion_source / attempts / repaired / repair_history / trace`，`Clarification` 暴露 `trace`，`last_trace` 暴露最近一次 ask/resolve 的透明 trace；`format_result_table` 负责文本展示。
-- `eval/run_eval.py`：`--execute` 用真实模型逐题创建 Connector/Engine/Orchestrator，单题异常记录为 `TaskOutcome.error` 且不中断整批；`matches_expected` 按标量/记录列表做启发式比对；`--outcomes` 写 JSONL，`--results` 读取 JSONL 算指标。`--execute` 拒绝 mock，支持 `--limit / --max-attempts`；`TaskOutcome` 新增 `attempts / error`，`first_pass_ok` 按“最终正确且未触发自修复”判定，澄清类任务按门禁是否正确触发判定成功。
+- `eval/run_eval.py`：`tasks.jsonl` 每行一个任务，可选 `session` 字段；同一 `session` 的任务必须连续且使用同一数据集，`execute_tasks` 复用同一 Orchestrator 串接多轮上下文（不同会话各自独立引擎，会话内触发澄清后丢弃该会话）。`--execute` 用真实模型逐题执行，单题异常记录为 `TaskOutcome.error` 且不中断整批；`matches_expected` 按标量/记录列表做启发式比对；`--outcomes` 写 JSONL，`--results` 读取 JSONL 算指标。`--execute` 拒绝 mock，支持 `--limit / --max-attempts`；`TaskOutcome` 含 `attempts / error`，`first_pass_ok` 按“最终正确且未触发自修复”判定，澄清类任务按门禁是否正确触发判定成功。`--anomaly-expectations` 读取数据集级预期异常代码，逐数据集体检一次并覆盖“数据异常检出率”指标（分母为预期异常代码数）。`eval/build_tasks.py` 用独立 pandas 计算生成并复核 150 条任务标准答案，`tests` 校验任务文件与该脚本一致。
+- `eval/anomaly_expectations.json`：映射脏数据集文件名到必须检出的异常代码集合（完全重复/主键重复/脏格式/缺失），供 `run_eval` 计算检出率。
 - `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `eval/run_rag.py`：读取 `eval/rag_tasks.jsonl` 的 50 条术语问法，按数据集生成数据字典，校验 `is_dictionary_question` 路由与 top-1 引用字段是否命中期望列，输出引用溯源准确率（目标 ≥90%）；当前模板集 50/50。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。

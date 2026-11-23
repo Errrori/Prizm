@@ -5,12 +5,15 @@ from typing import Any
 import pytest
 from eval.metrics import EvalTask, TaskOutcome, summarize
 from eval.run_eval import (
+    evaluate_anomalies,
     format_metric_table,
     format_task_summary,
+    load_anomaly_expectations,
     load_outcomes,
     load_tasks,
     main,
     missing_datasets,
+    with_anomaly_metric,
 )
 
 
@@ -111,9 +114,150 @@ def test_repository_minimal_tasks_are_valid() -> None:
     root = Path(__file__).resolve().parents[2]
     tasks = load_tasks(root / "eval" / "tasks.jsonl")
 
-    assert len(tasks) == 10
-    assert sum(task.expects_clarification for task in tasks) == 3
+    assert len(tasks) == 150
+    assert sum(task.expects_clarification for task in tasks) == 12
     assert missing_datasets(tasks, root / "eval" / "datasets") == []
+    assert {task.category for task in tasks} == {
+        "cleaning",
+        "aggregation",
+        "trend",
+        "attribution",
+        "multi_turn",
+    }
+    assert any(task.session for task in tasks)
+    assert {task.dataset for task in tasks} == {
+        "orders.csv",
+        "orders_dirty.csv",
+        "monthly_sales.csv",
+        "monthly_sales_dirty.csv",
+        "channel_traffic.csv",
+        "channel_traffic_dirty.csv",
+    }
+
+
+def test_load_tasks_rejects_non_contiguous_sessions(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    write_jsonl(
+        path,
+        [
+            {
+                "id": "t1",
+                "category": "multi_turn",
+                "dataset": "orders.csv",
+                "question": "第一轮",
+                "expected": 1,
+                "session": "s1",
+            },
+            {
+                "id": "t2",
+                "category": "multi_turn",
+                "dataset": "orders.csv",
+                "question": "独立一轮",
+                "expected": 1,
+            },
+            {
+                "id": "t3",
+                "category": "multi_turn",
+                "dataset": "orders.csv",
+                "question": "又回到会话",
+                "expected": 1,
+                "session": "s1",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="必须连续排列"):
+        load_tasks(path)
+
+
+def test_load_tasks_rejects_session_dataset_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.jsonl"
+    write_jsonl(
+        path,
+        [
+            {
+                "id": "t1",
+                "category": "multi_turn",
+                "dataset": "orders.csv",
+                "question": "第一轮",
+                "expected": 1,
+                "session": "s1",
+            },
+            {
+                "id": "t2",
+                "category": "multi_turn",
+                "dataset": "monthly_sales.csv",
+                "question": "第二轮",
+                "expected": 1,
+                "session": "s1",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="必须使用同一数据集"):
+        load_tasks(path)
+
+
+def test_repository_anomaly_expectations_are_detected() -> None:
+    root = Path(__file__).resolve().parents[2]
+    tasks = load_tasks(root / "eval" / "tasks.jsonl")
+    expectations = load_anomaly_expectations(
+        root / "eval" / "anomaly_expectations.json"
+    )
+
+    outcomes = evaluate_anomalies(tasks, root / "eval" / "datasets", expectations)
+
+    assert len(outcomes) == 3
+    for outcome in outcomes:
+        assert outcome.expected_anomalies == 4
+        assert outcome.detected_anomalies == outcome.expected_anomalies
+
+
+def test_repository_tasks_match_independent_builder() -> None:
+    from eval.build_tasks import build_tasks
+
+    root = Path(__file__).resolve().parents[2]
+    generated = build_tasks()
+    loaded = load_tasks(root / "eval" / "tasks.jsonl")
+
+    assert len(generated) == len(loaded)
+    for raw, task in zip(generated, loaded, strict=True):
+        assert task == EvalTask(
+            id=raw["id"],
+            category=raw["category"],
+            dataset=raw["dataset"],
+            question=raw["question"],
+            expected=raw["expected"],
+            expects_clarification=raw["expects_clarification"],
+            session=raw.get("session"),
+        )
+
+
+def test_with_anomaly_metric_uses_dataset_profiles() -> None:
+    root = Path(__file__).resolve().parents[2]
+    tasks = load_tasks(root / "eval" / "tasks.jsonl")
+    expectations = load_anomaly_expectations(
+        root / "eval" / "anomaly_expectations.json"
+    )
+    metrics = summarize(
+        [
+            TaskOutcome(
+                task_id="t1",
+                category="aggregation",
+                first_pass_ok=True,
+                final_ok=True,
+            )
+        ]
+    )
+
+    merged = with_anomaly_metric(
+        metrics, tasks, root / "eval" / "datasets", expectations
+    )
+
+    metric = merged["anomaly_detection_rate"]
+    assert metric.value == 1.0
+    assert metric.numerator == 12
+    assert metric.denominator == 12
 
 
 def test_load_outcomes_reads_jsonl(tmp_path: Path) -> None:

@@ -146,13 +146,13 @@
 - 还清记录：—
 
 ### DEBT-014 评测多轮任务未串接上一轮上下文
-- 状态：未还
+- 状态：已还清
 - 现状：`eval/run_eval.py --execute` 逐题独立创建 Orchestrator，`multi_turn` 任务没有带上上一题的问题/SQL/结果，只按单题执行。
 - 为什么简化：当前 `tasks.jsonl` 没有定义任务间的会话关系，先复用单题执行入口跑通指标。
 - 触发条件：正式验收多轮能力，或评测集补充多轮任务序列前。
 - 涉及文件：eval/run_eval.py, eval/tasks.jsonl
 - 登记日期：2026-11-21
-- 还清记录：—
+- 还清记录：2026-11-23 任务 10-1：`EvalTask` 增加 `session` 字段，`load_tasks` 校验同会话任务连续且同数据集；`execute_tasks` 按会话复用同一 Orchestrator，使追问注入上一轮 SQL/结果摘要；新增单测验证第二轮 prompt 含上一轮 SQL。commit 见本任务 git log。
 
 ### DEBT-015 多轮记忆只缓存摘要，未缓存可查询的上一轮结果
 - 状态：未还
@@ -236,13 +236,13 @@
 - 还清记录：—
 
 ### DEBT-024 评测集仅 10 题，未达需求约 50 题规模
-- 状态：未还
+- 状态：已还清
 - 现状：`eval/tasks.jsonl` 只有 10 题，覆盖 cleaning / aggregation / trend / attribution / multi_turn；数据集只有 `orders.csv` 与 `orders_dirty.csv`，未达到需求约定的约 50 题 × 3 个公开风格数据集。
 - 为什么简化：先跑通真实模型执行入口与指标；标准答案需人工设计，避免用模板答案自证。
 - 触发条件：对外正式验收、或宣称完成需求第 7 节全部评测指标前。
 - 涉及文件：eval/tasks.jsonl, eval/datasets, docs/requirements.md
 - 登记日期：2026-11-23
-- 还清记录：—
+- 还清记录：2026-11-23 任务 10-1：新增月度销量/渠道流量基础与脏数据集，评测集扩为 150 题（orders 55 / monthly 48 / traffic 47），五类任务与 12 条澄清场景全覆盖；标准答案由 `eval/build_tasks.py` 独立 pandas 计算生成并由单测比对；`anomaly_expectations.json` 接通异常检出率。真实模型复跑待额度恢复。commit 见本任务 git log。
 
 ### DEBT-025 README 演示 GIF 未录制
 - 状态：未还

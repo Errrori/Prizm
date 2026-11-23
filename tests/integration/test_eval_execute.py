@@ -41,6 +41,20 @@ SQL_BY_QUESTION = {
     ),
 }
 
+ORACLE_TASK_IDS = [
+    "clean-001",
+    "clean-002",
+    "clean-003",
+    "clean-004",
+    "clean-005",
+    "clean-006",
+    "clean-007",
+    "dirty-001",
+    "dirty-002",
+    "dirty-003",
+    "dirty-004",
+]
+
 
 class OracleLLM:
     """用标准 SQL 模拟“理想模型”，验证评测执行器与答案比对。"""
@@ -60,17 +74,19 @@ class OracleLLM:
 
 
 @pytest.mark.integration
-def test_minimal_tasks_can_reach_full_success_with_oracle_llm() -> None:
+def test_oracle_subset_can_reach_full_success() -> None:
     tasks = load_tasks(REPO_ROOT / DEFAULT_TASKS_PATH)
+    subset = [task for task in tasks if task.id in ORACLE_TASK_IDS]
     llm = OracleLLM()
 
-    outcomes = execute_tasks(tasks, REPO_ROOT / DEFAULT_DATASETS_DIR, llm)
+    outcomes = execute_tasks(subset, REPO_ROOT / DEFAULT_DATASETS_DIR, llm)
 
-    assert [outcome.task_id for outcome in outcomes] == [task.id for task in tasks]
+    assert [outcome.task_id for outcome in outcomes] == [task.id for task in subset]
     assert all(outcome.first_pass_ok for outcome in outcomes)
     assert all(outcome.final_ok for outcome in outcomes)
     assert all(outcome.error == "" for outcome in outcomes)
     assert llm.calls == 7
+    assert any(task.session == "orders-channel-followup" for task in subset)
 
     metrics = summarize(outcomes)
     assert metrics["first_pass_success_rate"].value == 1.0

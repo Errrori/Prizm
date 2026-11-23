@@ -31,6 +31,7 @@ from eval.metrics import (
     EvalTask,
     MetricResult,
     TaskOutcome,
+    anomaly_detection_rate,
     parse_task,
     summarize,
 )
@@ -47,12 +48,14 @@ from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMAdapter, LLMError, build_llm
+from prizm.profiling.profiler import profile_frame
 from prizm.rag.retriever import DictionaryAnswer
 from prizm.utils.tokens import DailyUsageLedger
 
 DEFAULT_TASKS_PATH = Path("eval/tasks.jsonl")
 DEFAULT_DATASETS_DIR = Path("eval/datasets")
 DEFAULT_OUTCOMES_PATH = Path("eval/outcomes/agent.jsonl")
+DEFAULT_ANOMALY_EXPECTATIONS = Path("eval/anomaly_expectations.json")
 
 METRIC_LABELS = {
     "first_pass_success_rate": "一次执行成功率",
@@ -82,7 +85,29 @@ def load_tasks(path: Path) -> list[EvalTask]:
             tasks.append(task)
     if not tasks:
         raise ValueError(f"{path}: 没有评测任务")
+    _validate_sessions(tasks, path)
     return tasks
+
+
+def _validate_sessions(tasks: Sequence[EvalTask], path: Path) -> None:
+    """同一 session 的任务必须连续且使用同一数据集，保证串接上下文可复现。"""
+    current: str | None = None
+    seen: dict[str, str] = {}
+    for task in tasks:
+        if task.session is None:
+            current = None
+            continue
+        if task.session != current:
+            if task.session in seen:
+                raise ValueError(
+                    f"{path}: 会话 {task.session!r} 的任务必须连续排列"
+                )
+            seen[task.session] = task.dataset
+            current = task.session
+        elif seen[task.session] != task.dataset:
+            raise ValueError(
+                f"{path}: 会话 {task.session!r} 的任务必须使用同一数据集"
+            )
 
 
 def missing_datasets(tasks: Sequence[EvalTask], datasets_dir: Path) -> list[str]:
@@ -216,45 +241,53 @@ def write_outcomes(path: Path, outcomes: Sequence[TaskOutcome]) -> None:
             file.write(json.dumps(asdict(outcome), ensure_ascii=False) + "\n")
 
 
-def execute_task(
+_EXECUTION_ERRORS = (
+    LLMError,
+    RepairFailed,
+    QueryTimeoutError,
+    ValueError,
+    RuntimeError,
+    OSError,
+    duckdb.Error,
+)
+
+
+def _build_orchestrator(
     task: EvalTask,
     datasets_dir: Path,
     llm: LLMAdapter,
+    engine: DuckDBEngine,
     *,
-    max_attempts: int = MAX_REPAIR_ATTEMPTS,
-    engine_factory: Callable[[], DuckDBEngine] = DuckDBEngine,
-) -> TaskOutcome:
-    """执行单个任务；单题失败只记录到 TaskOutcome，不中断整批评测。"""
+    max_attempts: int,
+) -> Orchestrator:
+    connector = CsvConnector(datasets_dir / task.dataset)
+    planner = Planner(llm)
+    return Orchestrator(
+        connector,
+        engine,
+        planner,
+        repairer=Repairer(planner, engine, max_attempts=max_attempts),
+    )
+
+
+def _error_outcome(task: EvalTask, exc: Exception) -> TaskOutcome:
+    attempts = exc.attempts if isinstance(exc, RepairFailed) else 1
+    return TaskOutcome(
+        task_id=task.id,
+        category=task.category,
+        first_pass_ok=False,
+        final_ok=False,
+        expected_clarification=task.expects_clarification,
+        attempts=attempts,
+        error=format_repair_error(exc),
+    )
+
+
+def _run_turn(orchestrator: Orchestrator, task: EvalTask) -> TaskOutcome:
     try:
-        with engine_factory() as engine:
-            connector = CsvConnector(datasets_dir / task.dataset)
-            planner = Planner(llm)
-            orchestrator = Orchestrator(
-                connector,
-                engine,
-                planner,
-                repairer=Repairer(planner, engine, max_attempts=max_attempts),
-            )
-            result = orchestrator.ask(task.question)
-    except (
-        LLMError,
-        RepairFailed,
-        QueryTimeoutError,
-        ValueError,
-        RuntimeError,
-        OSError,
-        duckdb.Error,
-    ) as exc:
-        attempts = exc.attempts if isinstance(exc, RepairFailed) else 1
-        return TaskOutcome(
-            task_id=task.id,
-            category=task.category,
-            first_pass_ok=False,
-            final_ok=False,
-            expected_clarification=task.expects_clarification,
-            attempts=attempts,
-            error=format_repair_error(exc),
-        )
+        result = orchestrator.ask(task.question)
+    except _EXECUTION_ERRORS as exc:
+        return _error_outcome(task, exc)
 
     if isinstance(result, Clarification):
         passed = task.expects_clarification
@@ -293,7 +326,29 @@ def execute_task(
     )
 
 
-# DEBT-014: 多轮任务仍按单题执行, 未串接上一轮上下文。
+def execute_task(
+    task: EvalTask,
+    datasets_dir: Path,
+    llm: LLMAdapter,
+    *,
+    max_attempts: int = MAX_REPAIR_ATTEMPTS,
+    engine_factory: Callable[[], DuckDBEngine] = DuckDBEngine,
+) -> TaskOutcome:
+    """执行单个任务；单题失败只记录到 TaskOutcome，不中断整批评测。"""
+    try:
+        with engine_factory() as engine:
+            orchestrator = _build_orchestrator(
+                task,
+                datasets_dir,
+                llm,
+                engine,
+                max_attempts=max_attempts,
+            )
+            return _run_turn(orchestrator, task)
+    except _EXECUTION_ERRORS as exc:
+        return _error_outcome(task, exc)
+
+
 def execute_tasks(
     tasks: Sequence[EvalTask],
     datasets_dir: Path,
@@ -303,19 +358,118 @@ def execute_tasks(
     engine_factory: Callable[[], DuckDBEngine] = DuckDBEngine,
     on_result: Callable[[TaskOutcome], None] | None = None,
 ) -> list[TaskOutcome]:
+    """按文件顺序执行任务；同一 ``session`` 复用编排器以串接多轮上下文。"""
     outcomes: list[TaskOutcome] = []
-    for task in tasks:
-        outcome = execute_task(
-            task,
-            datasets_dir,
-            llm,
-            max_attempts=max_attempts,
-            engine_factory=engine_factory,
-        )
-        outcomes.append(outcome)
-        if on_result is not None:
-            on_result(outcome)
+    sessions: dict[str, tuple[Orchestrator, DuckDBEngine]] = {}
+    try:
+        for task in tasks:
+            if task.session is None:
+                outcome = execute_task(
+                    task,
+                    datasets_dir,
+                    llm,
+                    max_attempts=max_attempts,
+                    engine_factory=engine_factory,
+                )
+            else:
+                entry = sessions.get(task.session)
+                if entry is None:
+                    engine = engine_factory()
+                    try:
+                        orchestrator = _build_orchestrator(
+                            task,
+                            datasets_dir,
+                            llm,
+                            engine,
+                            max_attempts=max_attempts,
+                        )
+                    except _EXECUTION_ERRORS as exc:
+                        engine.close()
+                        outcome = _error_outcome(task, exc)
+                    else:
+                        sessions[task.session] = (orchestrator, engine)
+                        outcome = _run_turn(orchestrator, task)
+                        if outcome.clarification_triggered:
+                            sessions.pop(task.session)[1].close()
+                else:
+                    outcome = _run_turn(entry[0], task)
+                    if outcome.clarification_triggered:
+                        sessions.pop(task.session)[1].close()
+            outcomes.append(outcome)
+            if on_result is not None:
+                on_result(outcome)
+    finally:
+        for _, engine in sessions.values():
+            engine.close()
     return outcomes
+
+
+def load_anomaly_expectations(path: Path) -> dict[str, tuple[str, ...]]:
+    """读取每个数据集应被体检检出的异常代码；文件不存在时返回空映射。"""
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path}: JSON 解析失败: {exc.msg}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: 必须是 JSON 对象")
+
+    expectations: dict[str, tuple[str, ...]] = {}
+    for dataset, codes in raw.items():
+        if not isinstance(dataset, str) or not dataset.strip():
+            raise ValueError(f"{path}: 数据集名必须是非空字符串")
+        if not isinstance(codes, list) or not all(
+            isinstance(code, str) and code.strip() for code in codes
+        ):
+            raise ValueError(f"{path}: {dataset} 的异常代码必须是字符串列表")
+        expectations[dataset] = tuple(codes)
+    return expectations
+
+
+def evaluate_anomalies(
+    tasks: Sequence[EvalTask],
+    datasets_dir: Path,
+    expectations: dict[str, tuple[str, ...]],
+) -> list[TaskOutcome]:
+    """对任务引用到的数据集各体检一次，统计预期异常代码的检出情况。"""
+    outcomes: list[TaskOutcome] = []
+    profiled: set[str] = set()
+    for task in tasks:
+        dataset = task.dataset
+        if dataset not in expectations or dataset in profiled:
+            continue
+        profiled.add(dataset)
+        frame = CsvConnector(datasets_dir / dataset).load()
+        profile = profile_frame(frame)
+        expected = tuple(dict.fromkeys(expectations[dataset]))
+        detected = sum(code in profile.anomaly_codes for code in expected)
+        outcomes.append(
+            TaskOutcome(
+                task_id=f"anomaly:{dataset}",
+                category="cleaning",
+                first_pass_ok=True,
+                final_ok=True,
+                expected_anomalies=len(expected),
+                detected_anomalies=detected,
+            )
+        )
+    return outcomes
+
+
+def with_anomaly_metric(
+    metrics: dict[str, MetricResult],
+    tasks: Sequence[EvalTask],
+    datasets_dir: Path,
+    expectations: dict[str, tuple[str, ...]],
+) -> dict[str, MetricResult]:
+    """用数据集级体检结果覆盖指标表中的异常检出率。"""
+    anomaly_outcomes = evaluate_anomalies(tasks, datasets_dir, expectations)
+    if not anomaly_outcomes:
+        return metrics
+    merged = dict(metrics)
+    merged["anomaly_detection_rate"] = anomaly_detection_rate(anomaly_outcomes)
+    return merged
 
 
 def format_metric_table(metrics: dict[str, MetricResult]) -> str:
@@ -362,6 +516,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--max-attempts", type=int, default=MAX_REPAIR_ATTEMPTS)
     parser.add_argument("--limit", type=int, default=None, help="仅执行前 N 题")
+    parser.add_argument(
+        "--anomaly-expectations",
+        type=Path,
+        default=DEFAULT_ANOMALY_EXPECTATIONS,
+        help="数据集级异常检出预期 JSON",
+    )
     args = parser.parse_args(argv)
 
     if args.execute and args.results is not None:
@@ -382,13 +542,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
-    if args.execute and args.limit is not None:
-        tasks = tasks[: args.limit]
 
     missing = missing_datasets(tasks, args.datasets_dir)
     if missing:
         print(f"错误: 缺少数据集: {', '.join(missing)}", file=sys.stderr)
         return 2
+
+    try:
+        expectations = load_anomaly_expectations(args.anomaly_expectations)
+    except (OSError, ValueError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+
+    all_tasks = tasks
+    if args.execute and args.limit is not None:
+        tasks = tasks[: args.limit]
 
     print(format_task_summary(tasks))
 
@@ -439,7 +607,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(f"结果已写入: {args.outcomes}")
 
-        metrics = summarize(outcomes)
+        metrics = with_anomaly_metric(
+            summarize(outcomes), all_tasks, args.datasets_dir, expectations
+        )
         print()
         print(format_metric_table(metrics))
         return 0 if all(metric.passed is not False for metric in metrics.values()) else 1
@@ -455,7 +625,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
-    metrics = summarize(outcomes)
+    metrics = with_anomaly_metric(
+        summarize(outcomes), all_tasks, args.datasets_dir, expectations
+    )
     print()
     print(format_metric_table(metrics))
     return 0 if all(metric.passed is not False for metric in metrics.values()) else 1

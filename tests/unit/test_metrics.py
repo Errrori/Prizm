@@ -66,6 +66,35 @@ def test_parse_task_keeps_explicit_clarification_flag() -> None:
     assert task.expects_clarification is True
 
 
+def test_parse_task_reads_session() -> None:
+    task = parse_task(
+        {
+            "id": "orders-006",
+            "category": "multi_turn",
+            "dataset": "orders.csv",
+            "question": "只看已完成订单，再按渠道统计销售额。",
+            "expected": [],
+            "session": "orders-followup",
+        }
+    )
+
+    assert task.session == "orders-followup"
+
+
+def test_parse_task_rejects_blank_session() -> None:
+    with pytest.raises(ValueError, match="session 必须是非空字符串"):
+        parse_task(
+            {
+                "id": "orders-007",
+                "category": "multi_turn",
+                "dataset": "orders.csv",
+                "question": "再统计一次",
+                "expected": [],
+                "session": "  ",
+            }
+        )
+
+
 def test_parse_task_rejects_missing_fields() -> None:
     with pytest.raises(ValueError, match="任务缺少字段: category, question"):
         parse_task(

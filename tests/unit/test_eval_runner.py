@@ -190,6 +190,49 @@ def test_execute_tasks_records_exhausted_repair(tmp_path: Path) -> None:
     assert len(llm.calls) == 2
 
 
+def test_execute_tasks_reuses_session_context(tmp_path: Path) -> None:
+    pd.DataFrame(
+        {
+            "status": ["已完成", "已完成", "已取消"],
+            "channel": ["线上", "线下", "线上"],
+            "sales": [100, 200, 999],
+        }
+    ).to_csv(tmp_path / "orders.csv", index=False, encoding="utf-8")
+    tasks = [
+        EvalTask(
+            id="turn-1",
+            category="multi_turn",
+            dataset="orders.csv",
+            question="已完成订单的销售额是多少？",
+            expected=300,
+            session="orders-session",
+        ),
+        EvalTask(
+            id="turn-2",
+            category="multi_turn",
+            dataset="orders.csv",
+            question="只看线上渠道，再算一次销售额。",
+            expected=100,
+            session="orders-session",
+        ),
+    ]
+    first_sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    second_sql = (
+        "SELECT SUM(sales) AS total FROM orders "
+        "WHERE status = '已完成' AND channel = '线上'"
+    )
+    llm = ScriptedLLM([plan(first_sql), plan(second_sql)])
+
+    outcomes = execute_tasks(tasks, tmp_path, llm)
+
+    assert all(outcome.final_ok for outcome in outcomes)
+    assert len(llm.calls) == 2
+    second_prompt = llm.calls[1][-1]["content"]
+    assert "最近对话与结果" in second_prompt
+    assert first_sql in second_prompt
+    assert "第 1 轮问题" in second_prompt
+
+
 def test_write_outcomes_round_trips(tmp_path: Path) -> None:
     outcomes = [
         TaskOutcome(

@@ -5,11 +5,12 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 
 from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
+from prizm.agent.composer import Conclusion, ConclusionComposer, template_conclusion
 from prizm.agent.memory import ConversationMemory, Turn
 from prizm.agent.planner import Planner
 from prizm.agent.repair import RepairAttempt, Repairer, RepairFailed
@@ -25,6 +26,9 @@ from prizm.profiling.models import Anomaly, ProfileReport
 from prizm.profiling.profiler import ProfileOptions, profile_frame
 from prizm.rag.retriever import DictionaryAnswer, DictionaryQA, is_dictionary_question
 
+if TYPE_CHECKING:
+    from prizm.viz.charts import ChartSpec
+
 _HISTORY_PREVIEW_ROWS = 3
 
 
@@ -34,6 +38,9 @@ class Answer:
     sql: str
     dataframe: pd.DataFrame
     chart: dict[str, Any] | None = None
+    chart_png: bytes | None = None
+    conclusion: str = ""
+    conclusion_source: str = "template"
     attempts: int = 1
     repair_history: tuple[RepairAttempt, ...] = ()
     trace: Trace | None = None
@@ -92,6 +99,7 @@ class Orchestrator:
         repairer: Repairer | None = None,
         memory: ConversationMemory | None = None,
         dictionary_qa: DictionaryQA | None = None,
+        conclusion_composer: ConclusionComposer | None = None,
     ) -> None:
         self._frame = connector.load()
         self._engine = engine
@@ -99,6 +107,7 @@ class Orchestrator:
         self._repairer = repairer or Repairer(planner, engine)
         self._memory = memory or ConversationMemory()
         self._dictionary_qa = dictionary_qa
+        self._conclusion_composer = conclusion_composer
         self._profile_options = profile_options or ProfileOptions()
         self._profile = profile_frame(
             self._frame,
@@ -275,7 +284,6 @@ class Orchestrator:
             )
             raise
 
-        elapsed_ms = (time.perf_counter() - start) * 1000
         steps.append(
             TraceStep("SQL 规划", "ok", "已生成只读 SQL", detail=outcome.plan.sql)
         )
@@ -296,6 +304,43 @@ class Orchestrator:
                 f"返回 {len(dataframe)} 行 × {len(dataframe.columns)} 列",
             )
         )
+
+        chart_spec, chart_payload, chart_png, chart_step = _render_plan_chart(
+            outcome.plan.chart, dataframe
+        )
+        if chart_step is not None:
+            steps.append(chart_step)
+
+        if self._conclusion_composer is None:
+            conclusion = Conclusion(template_conclusion(dataframe))
+            steps.append(TraceStep("结论生成", "ok", "使用模板结论（未启用模型归纳）"))
+        else:
+            conclusion = self._conclusion_composer.compose(
+                question,
+                outcome.plan.sql,
+                dataframe,
+                chart=chart_spec,
+            )
+            if conclusion.source == "llm":
+                steps.append(
+                    TraceStep(
+                        "结论生成",
+                        "ok",
+                        "已用模型归纳结果",
+                        detail=conclusion.text,
+                    )
+                )
+            else:
+                steps.append(
+                    TraceStep(
+                        "结论生成",
+                        "fallback",
+                        "模型结论不可用，已回退模板",
+                        detail=conclusion.fallback_reason,
+                    )
+                )
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
         trace = Trace(
             question=question,
             steps=tuple(steps),
@@ -312,7 +357,10 @@ class Orchestrator:
             question=question,
             sql=outcome.plan.sql,
             dataframe=dataframe,
-            chart=outcome.plan.chart,
+            chart=chart_payload,
+            chart_png=chart_png,
+            conclusion=conclusion.text,
+            conclusion_source=conclusion.source,
             attempts=outcome.attempts,
             repair_history=outcome.history,
             trace=trace,
@@ -359,6 +407,56 @@ class Orchestrator:
             remaining=pending.remaining_after,
             trace=trace,
         )
+
+
+def _render_plan_chart(
+    raw: dict[str, Any] | None,
+    dataframe: pd.DataFrame,
+) -> tuple[ChartSpec | None, dict[str, Any] | None, bytes | None, TraceStep | None]:
+    """校验并渲染图表；图表属于展示层，失败不阻断分析。"""
+    if raw is None:
+        return None, None, None, None
+
+    from prizm.viz.charts import (
+        MAX_CHART_POINTS,
+        ChartError,
+        parse_chart_spec,
+        render_chart,
+    )
+
+    try:
+        spec = parse_chart_spec(raw, dataframe.columns)
+        if spec is None:
+            return None, None, None, None
+        png = render_chart(spec, dataframe)
+    except ChartError as exc:
+        return (
+            None,
+            None,
+            None,
+            TraceStep(
+                "图表",
+                "skipped",
+                "图表参数不可用，已改用表格展示",
+                detail=str(exc),
+            ),
+        )
+
+    detail = spec.title
+    if len(dataframe) > MAX_CHART_POINTS:
+        note = f"仅展示前 {MAX_CHART_POINTS} 个数据点"
+        detail = f"{spec.title}（{note}）" if spec.title else note
+    return (
+        spec,
+        spec.as_dict(),
+        png,
+        TraceStep(
+            "图表",
+            "ok",
+            f"已渲染 {spec.type} 图：{spec.x} → {spec.y}",
+            detail=detail,
+        ),
+    )
 
 
 def _profile_references(

@@ -1,6 +1,6 @@
 """把自然语言问题规划为只读 SQL 与可选 chart spec。
 
-本阶段只产出 SQL，不执行、不生成自由 Python；chart 固定为 null。
+不执行、不生成自由 Python；图表只输出结构化 spec，由渲染层安全绘制。
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from prizm.llm.adapter import LLMAdapter, Message
 
 SYSTEM_PROMPT = """你是数据分析 SQL 规划器，只输出一个 JSON 对象，不要输出解释或 Markdown。
 JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
+或：{"sql": "<DuckDB 只读 SQL>", "chart": {"type": "bar|line|pie|scatter",
+"x": "<列名>", "y": "<列名>", "title": "<可选标题>"}}
 规则：
 - 只能生成单条 SELECT 或 WITH ... SELECT 语句，禁止任何写操作或 DDL。
 - 只能使用给定 schema 中存在的列，不要臆造列名。
@@ -25,7 +27,9 @@ JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 - 若提供了最近对话与结果，结合上一轮问题和 SQL 理解“上一题/再算一次”等指代。
 - 若提供了用户已确认的数据口径，必须严格遵循，不得自行更改。
 - 若提供了上次失败信息，必须针对错误修正 SQL，不要重复同样的错误。
-- 本阶段不绘图，chart 必须为 null。"""
+- chart 可选，只有结果适合图表时才提供：x 为分类/时间列，y 为数值列，且都必须是 SQL 结果中的列名。
+- bar 用于分类对比，line 用于趋势，pie 用于占比（y 必须非负），scatter 用于两个数值列的关系。
+- 单值汇总、多列明细或无法确定合适坐标轴时，chart 必须为 null。"""
 
 
 class PlanParseError(ValueError):

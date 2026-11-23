@@ -10,7 +10,7 @@
 ---
 
 ## 当前阶段
-阶段 P2 与 MVP 数据源已闭环（CSV/Excel/SQLite）；下一步结果呈现（图表 + 结论）
+P0 图表 + 结论链路已补齐；下一步真实模型评测与交付物
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -23,17 +23,18 @@
 - 任务 4-1：多轮上下文，数据集只加载一次并注入历史摘要
 - 任务 5-1/5-2：RAG 数据字典 + 50 条术语评测（引用溯源 50/50）
 - 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、各阶段记录、Chainlit 嵌套 Step + 侧栏面板
-- 任务 7-1：Excel(.xlsx) / SQLite connector + 上传端多 sheet/多表选择；268 项 pytest 全绿
+- 任务 7-1：Excel(.xlsx) / SQLite connector + 上传端多 sheet/多表选择
+- 任务 8-1：结构化 chart spec（bar/line/pie/scatter）+ matplotlib PNG + LLM 结论（模板兜底）；304 项 pytest 全绿
 
 ## 进行中
 - 无
 
 ## 下一步
-- 结果呈现模块：chart spec → matplotlib PNG + LLM 结论（失败回退模板文本）
 - 真实模型评测：验证一次成功率 ≥75%、自修复后 ≥90%
 - 交付物：README（架构图/演示/评测表）与 Dockerfile 复核
 
 ## 阻塞与风险
+- 非阻塞：DEBT-023 LLM 结论未纳入评测，失败静默回退模板；DEBT-022 中文字体与 50 点上限
 - 非阻塞：DEBT-021 Excel/SQLite 仅单表整表读取；不支持 .xls、多表关联、视图与多级表头
 - 非阻塞：DEBT-020 透明面板为执行后一次性渲染，未提供流式过程反馈
 - 非阻塞：DEBT-019 RAG 评测集为模板生成；DEBT-016 路由启发式；DEBT-017 问答未用 LLM 归纳；DEBT-018 50 条 QA 评测待建

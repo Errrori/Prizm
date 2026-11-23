@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from prizm.agent.composer import ConclusionComposer
 from prizm.agent.orchestrator import (
     Answer,
     Clarification,
@@ -17,7 +18,7 @@ from prizm.agent.repair import RepairFailed
 from prizm.agent.trace import Trace
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
-from prizm.llm.adapter import Completion, Message, MockLLM
+from prizm.llm.adapter import Completion, LLMError, Message, MockLLM
 from prizm.rag.ingest import DictionaryEntry
 from prizm.rag.retriever import DataDictionaryRetriever, DictionaryAnswer, DictionaryQA
 
@@ -65,6 +66,15 @@ class SequenceLLM:
         return Completion(self.responses.pop(0))
 
 
+@dataclass
+class FailingLLM:
+    error: Exception
+
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        raise self.error
+
+
+
 def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "orders.csv"
     write_orders(path)
@@ -96,7 +106,10 @@ def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
         "体检与澄清判定",
         "SQL 规划",
         "执行",
+        "结论生成",
     ]
+    assert answer.conclusion
+    assert answer.conclusion_source == "template"
     assert orchestrator.last_trace is answer.trace
 
 
@@ -128,7 +141,11 @@ def test_orchestrator_repairs_after_sql_error(tmp_path: Path) -> None:
     assert isinstance(answer.trace, Trace)
     assert answer.trace.execution_status == "repaired"
     assert answer.trace.attempts == 2
-    assert [step.name for step in answer.trace.steps][-2:] == ["自修复", "执行"]
+    assert [step.name for step in answer.trace.steps][-3:] == [
+        "自修复",
+        "执行",
+        "结论生成",
+    ]
 
 
 def test_orchestrator_reuses_dataset_and_injects_history(tmp_path: Path) -> None:
@@ -335,3 +352,93 @@ def test_orchestrator_records_failed_trace_when_repair_exhausted(tmp_path: Path)
     assert trace.steps[-1].name == "SQL 规划与执行"
     assert trace.steps[-1].status == "failed"
     assert "missing_column" in (trace.steps[-1].detail or "")
+
+
+def test_orchestrator_renders_chart_from_plan(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = (
+        "SELECT channel, SUM(sales) AS total FROM orders "
+        "WHERE status = '已完成' GROUP BY channel ORDER BY total DESC"
+    )
+    chart = {"type": "bar", "x": "channel", "y": "total", "title": "各渠道销售额"}
+    llm = MockLLM(json.dumps({"sql": sql, "chart": chart}, ensure_ascii=False))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        answer = orchestrator.ask("按渠道统计已完成销售额")
+
+    assert answer.chart == chart
+    assert answer.chart_png is not None
+    assert answer.chart_png.startswith(b"\x89PNG\r\n\x1a\n")
+    chart_step = next(step for step in answer.trace.steps if step.name == "图表")
+    assert chart_step.status == "ok"
+    assert "bar" in chart_step.summary
+
+
+def test_orchestrator_skips_invalid_chart_without_failing(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = "SELECT channel, SUM(sales) AS total FROM orders GROUP BY channel"
+    chart = {"type": "bar", "x": "missing", "y": "total"}
+    llm = MockLLM(json.dumps({"sql": sql, "chart": chart}))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        answer = orchestrator.ask("按渠道统计销售额")
+
+    assert answer.chart is None
+    assert answer.chart_png is None
+    assert int(answer.dataframe["total"].sum()) == 1299
+    chart_step = next(step for step in answer.trace.steps if step.name == "图表")
+    assert chart_step.status == "skipped"
+    assert "不在结果列中" in (chart_step.detail or "")
+
+
+def test_orchestrator_uses_llm_conclusion_when_configured(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    planner_llm = MockLLM(json.dumps({"sql": sql, "chart": None}))
+    composer_llm = MockLLM("已完成订单的销售额合计为 300。")
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(
+            CsvConnector(path),
+            engine,
+            Planner(planner_llm),
+            conclusion_composer=ConclusionComposer(composer_llm),
+        )
+        answer = orchestrator.ask("已完成订单的销售额是多少？")
+
+    assert answer.conclusion == "已完成订单的销售额合计为 300。"
+    assert answer.conclusion_source == "llm"
+    conclusion_step = next(step for step in answer.trace.steps if step.name == "结论生成")
+    assert conclusion_step.status == "ok"
+    assert conclusion_step.detail == answer.conclusion
+    prompt = composer_llm.calls[0][1]["content"]
+    assert "已完成订单的销售额是多少？" in prompt
+    assert sql in prompt
+    assert "300" in prompt
+
+
+def test_orchestrator_falls_back_to_template_when_conclusion_fails(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    planner_llm = MockLLM(json.dumps({"sql": sql, "chart": None}))
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(
+            CsvConnector(path),
+            engine,
+            Planner(planner_llm),
+            conclusion_composer=ConclusionComposer(FailingLLM(LLMError("模型超时"))),
+        )
+        answer = orchestrator.ask("已完成订单的销售额是多少？")
+
+    assert answer.conclusion_source == "template"
+    assert answer.conclusion == "total = 300。"
+    conclusion_step = next(step for step in answer.trace.steps if step.name == "结论生成")
+    assert conclusion_step.status == "fallback"
+    assert "模型超时" in (conclusion_step.detail or "")

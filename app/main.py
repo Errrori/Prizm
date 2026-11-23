@@ -9,6 +9,7 @@ import chainlit as cl
 import duckdb
 
 from prizm.agent.clarify import ClarifyGate, LLMAmbiguityJudge
+from prizm.agent.composer import ConclusionComposer
 from prizm.agent.orchestrator import (
     Answer,
     Clarification,
@@ -114,6 +115,7 @@ async def on_chat_start() -> None:
         engine,
         Planner(llm),
         clarify_gate=ClarifyGate(ambiguity_judge=ambiguity_judge),
+        conclusion_composer=None if settings.is_mock else ConclusionComposer(llm),
     )
     generated_entries = build_data_dictionary(
         orchestrator.dataframe,
@@ -203,8 +205,13 @@ async def on_message(message: cl.Message) -> None:
         return
 
     assert isinstance(result, Answer)
+    if result.chart_png is not None:
+        elements.append(cl.Image(content=result.chart_png, name="chart.png", display="inline"))
+    conclusion = result.conclusion or "（本次未生成结论）"
     await cl.Message(
         content=(
+            "**结论**\n"
+            f"{conclusion}\n\n"
             "**生成的 SQL**\n"
             f"```sql\n{result.sql}\n```\n\n"
             "**结果**\n"

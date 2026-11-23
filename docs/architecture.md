@@ -122,6 +122,13 @@ flowchart TD
 - **代价**：极端同义/口语化查询召回可能不足；用评测数据决定是否启用向量。
 - **重估条件**：术语 QA 召回不达标时启用 `vector`。
 
+### ADR-0007 结果呈现：结构化 chart spec + LLM 结论（模板兜底）
+- **决策**：Planner 只输出结构化 chart spec（bar/line/pie/scatter + x/y/title），`viz/charts` 校验后用 matplotlib Agg 渲染 PNG；结论由 `ConclusionComposer` 基于问题、SQL 与前 10 行样本让 LLM 归纳，失败/额度不足/空输出回退模板文本。
+- **理由**：延续 SQL-first 的“无自由绘图代码”，图表输入可审计；结论生成与 SQL 执行解耦，模型失败不阻断已算出的结果。
+- **被否**：让 LLM 直接写 matplotlib 代码——安全面失控；只返回表格——不满足 P0 的“图表 + 结论”。
+- **代价**：真实模型多一次调用；结论质量尚未纳入评测，中文字体依赖系统字体（见 DEBT-022/023）。
+- **重估条件**：需要对外报告结论质量，或图表类型/多序列需求扩大时。
+
 ## 6. 不变量（不可违背）
 
 - **密钥**：仅来自环境变量或会话输入，只存内存；不落盘、不打日志、不进仓库。
@@ -135,7 +142,7 @@ flowchart TD
 | 需求 | 承载模块 |
 |---|---|
 | P0 数据体检 | `profiling/`（自研，埋雷集检出率 100% 由单测保障） |
-| P0 对话式分析 | `agent/orchestrator` + `agent/planner` + `engine/duckdb` |
+| P0 对话式分析 | `agent/orchestrator` + `agent/planner` + `engine/duckdb` + `viz/charts` + `agent/composer` |
 | P0 澄清机制 | `agent/clarify`（该问就问 / 不该问不问） |
 | P1 自修复 | `agent/repair`（≤3 次） |
 | P1 多轮上下文 | `agent/memory` + 会话缓存 |
@@ -162,7 +169,7 @@ Prizm/
 │  ├─ datasource/            # base / csv / excel / sqlite connector
 │  ├─ engine/duckdb_engine.py# SQL 执行 + 限额
 │  ├─ profiling/             # profiler / checks / models
-│  ├─ agent/                 # orchestrator / clarify / planner / repair / memory / trace / prompts
+│  ├─ agent/                 # orchestrator / clarify / planner / repair / memory / trace / composer / prompts
 │  ├─ sandbox/               # policy / executor / runner（pandas 兜底）
 │  ├─ rag/                   # index / retriever / ingest
 │  ├─ viz/charts.py          # chart spec → matplotlib PNG
@@ -183,11 +190,13 @@ Prizm/
 - `prizm.agent.trace`：`TraceStep(name, status, summary, detail)`、`ProfileReference(code, column, count, reason)`、`Trace(question, steps, generated_sql, execution_status, profile_references, confirmed_policies, attempts, elapsed_ms)`；`to_panel_markdown()` 渲染“执行状态 + 生成 SQL + 引用体检结论 + 已确认口径 + 步骤时间线”。只保存摘要与引用，不保存全量数据、样本行或密钥。
 - `prizm.rag.ingest`：`DictionaryEntry(id, text, source, column)`；`build_data_dictionary(frame, profile=None, source=...)` 生成数据集概览 + 每列统计/示例/异常提示；`parse_dictionary_text(text, source=...)` 与 `load_dictionary_file(path)` 摄取 UTF-8/GBK 的 .md/.txt 说明文档并按段落/标题切片。
 - `prizm.rag.index / retriever`：`BM25Index` 使用 BM25Plus + 中文二元字组/英文词切分；`DataDictionaryRetriever(default_top_k=3).search(query)` 返回带分数与名次的命中；`DictionaryQA.answer(question) -> DictionaryAnswer(text, citations)` 拼接带来源/字段的原文片段；`is_dictionary_question` 做关键词路由。`Orchestrator` 可挂载 `DictionaryQA`，术语问题不生成 SQL，直接返回可溯源片段。
-- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, conversation_summary=None, repair_feedback=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；有多轮摘要时追加“最近对话与结果（用于理解指代，不要臆造）”段；有修复反馈时追加“上一次尝试失败，需要修复”段；`parse_plan` 校验 JSON 并解析可选 chart。
+- `prizm.agent.planner.Planner.plan(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, conversation_summary=None, repair_feedback=None) -> Plan(sql, chart)`：prompt 有体检摘要时只注入摘要（含 schema/统计/样本），否则回退为 schema + 前 5 行样本；有已确认口径时追加“用户已确认的数据口径（必须遵守）”段；有多轮摘要时追加“最近对话与结果（用于理解指代，不要臆造）”段；有修复反馈时追加“上一次尝试失败，需要修复”段；`parse_plan` 校验 JSON 并解析可选 chart（结构由渲染层校验）。
+- `prizm.viz.charts`：`ChartSpec(type ∈ bar/line/pie/scatter, x, y, title)`、`parse_chart_spec(raw, columns) -> ChartSpec | None`、`render_chart(spec, frame, max_points=50) -> bytes`；y 列自动转数值，空结果/无非数值/饼图负值抛 `ChartError`，matplotlib 只用 Agg 与结构化 spec，不执行自由绘图代码。
+- `prizm.agent.composer`：`Conclusion(text, source, fallback_reason)`、`template_conclusion(frame)`、`ConclusionComposer(llm).compose(question, sql, frame, chart=None) -> Conclusion`；prompt 只注入结果规模与前 10 行样本，LLM 失败/额度不足/空输出回退模板文本。
 - `prizm.agent.repair.Repairer(planner, engine, max_attempts=3).run(question, view_name, frame, *, profile_summary=None, confirmed_policies=None, conversation_summary=None) -> RepairResult(plan, dataframe, attempts, history)`：总尝试不超过 3 次（含首次）；解析/校验/执行/超时错误回传错误类型与消息并重新规划，重试时保留多轮摘要；LLM 调用失败与额度超限不重试；耗尽抛 `RepairFailed(question, attempts, last_error, history)`。`format_repair_error` 不回传本机 traceback。
-- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None, repairer=None, memory=None).ask(question) -> Answer | Clarification | DictionaryAnswer`；构造时自动体检一次并只加载一次数据，`profile` 属性暴露 `ProfileReport`；每轮成功后在 `memory` 记录 `Turn` 并供下一轮 planner 注入，`history` 暴露最近轮次；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后复核并重跑原问题、注入口径；执行经 `Repairer`，`Answer` 暴露 `attempts / repaired / repair_history / trace`，`Clarification` 暴露 `trace`，`last_trace` 暴露最近一次 ask/resolve 的透明 trace；`format_result_table` 负责文本展示。
+- `prizm.agent.orchestrator.Orchestrator(connector, engine, planner, *, profile_options=None, primary_key=None, clarify_gate=None, repairer=None, memory=None, conclusion_composer=None).ask(question) -> Answer | Clarification | DictionaryAnswer`；构造时自动体检一次并只加载一次数据，`profile` 属性暴露 `ProfileReport`；每轮成功后在 `memory` 记录 `Turn` 并供下一轮 planner 注入，`history` 暴露最近轮次；命中澄清时不规划、不执行，`pending_clarification` 暴露当前请求，`resolve(value)` 逐项确认后复核并重跑原问题、注入口径；执行经 `Repairer`，再经 `viz.charts` 校验并渲染 `chart_png`（失败只标记 trace，不改表格结果），最后按 `conclusion_composer` 生成结论（未配置时用模板）；`Answer` 暴露 `chart / chart_png / conclusion / conclusion_source / attempts / repaired / repair_history / trace`，`Clarification` 暴露 `trace`，`last_trace` 暴露最近一次 ask/resolve 的透明 trace；`format_result_table` 负责文本展示。
 - `eval/run_eval.py`：`--execute` 用真实模型逐题创建 Connector/Engine/Orchestrator，单题异常记录为 `TaskOutcome.error` 且不中断整批；`matches_expected` 按标量/记录列表做启发式比对；`--outcomes` 写 JSONL，`--results` 读取 JSONL 算指标。`--execute` 拒绝 mock，支持 `--limit / --max-attempts`；`TaskOutcome` 新增 `attempts / error`，`first_pass_ok` 按“最终正确且未触发自修复”判定，澄清类任务按门禁是否正确触发判定成功。
 - `eval/run_clarify.py`：复用 `eval/tasks.jsonl` 与数据集，输出异常场景召回与整体触发准确率；默认规则/启发式，不调用真实模型。
 - `eval/run_rag.py`：读取 `eval/rag_tasks.jsonl` 的 50 条术语问法，按数据集生成数据字典，校验 `is_dictionary_question` 路由与 top-1 引用字段是否命中期望列，输出引用溯源准确率（目标 ≥90%）；当前模板集 50/50。
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
-- 入口 `app/main.py`：Chainlit 上传 CSV / Excel(.xlsx) / SQLite（可选同时上传 .md/.txt 数据说明）→ 注册 DuckDB → 生成并展示体检报告与数据字典 → 提问；Excel 多工作表或 SQLite 多表时用动作消息让用户选一个；术语问题走 RAG 展示带出处的字典片段，分析问题展示 SQL + 结果；按 `Trace` 渲染嵌套 Step 时间线，并用侧栏 `cl.Text` 展示透明面板（执行状态、生成 SQL、引用体检结论、已确认口径、尝试/修复记录）；`RepairFailed` 时展示最终错误与失败面板；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。
+- 入口 `app/main.py`：Chainlit 上传 CSV / Excel(.xlsx) / SQLite（可选同时上传 .md/.txt 数据说明）→ 注册 DuckDB → 生成并展示体检报告与数据字典 → 提问；Excel 多工作表或 SQLite 多表时用动作消息让用户选一个；术语问题走 RAG 展示带出处的字典片段，分析问题展示结论 + 图表（`cl.Image`）+ SQL + 结果；真实模型模式挂载 `ConclusionComposer`，mock 模式用模板结论；按 `Trace` 渲染嵌套 Step 时间线，并用侧栏 `cl.Text` 展示透明面板（执行状态、生成 SQL、引用体检结论、已确认口径、图表/结论/尝试/修复记录）；`RepairFailed` 时展示最终错误与失败面板；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。

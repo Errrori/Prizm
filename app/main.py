@@ -16,6 +16,7 @@ from prizm.agent.orchestrator import (
 )
 from prizm.agent.planner import Planner, build_mock_plan_response
 from prizm.agent.repair import RepairFailed
+from prizm.agent.trace import Trace
 from prizm.config import get_settings
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
@@ -134,12 +135,9 @@ async def on_message(message: cl.Message) -> None:
 
     result: Answer | Clarification | DictionaryAnswer
     try:
-        async with cl.Step(name="澄清判定与规划", type="tool") as step:
-            step.input = message.content
-            result = orchestrator.ask(message.content)
-            step.output = _step_output(result)
-
+        result = orchestrator.ask(message.content)
         while isinstance(result, Clarification):
+            await _show_trace(orchestrator.last_trace)
             response = await cl.AskActionMessage(
                 content=(f"{result.request.question}\n\n依据：{result.request.reason}"),
                 actions=[
@@ -156,14 +154,13 @@ async def on_message(message: cl.Message) -> None:
             if selected is None:
                 await cl.Message(content="未收到有效选择，已取消本次分析。").send()
                 return
-            async with cl.Step(name="按确认口径执行", type="tool") as step:
-                step.input = selected
-                result = orchestrator.resolve(selected)
-                step.output = _step_output(result)
+            result = orchestrator.resolve(selected)
     except QuotaExceededError:
+        await _show_trace(orchestrator.last_trace)
         await cl.Message(content="今日模型额度已用完，请明天再试，或改用你自己的 API key。").send()
         return
     except RepairFailed as exc:
+        await _show_trace(orchestrator.last_trace)
         await cl.Message(
             content=(
                 f"分析失败：已尝试 {exc.attempts} 次仍无法执行。\n"
@@ -172,11 +169,14 @@ async def on_message(message: cl.Message) -> None:
         ).send()
         return
     except (LLMError, QueryTimeoutError, ValueError, RuntimeError, duckdb.Error) as exc:
+        await _show_trace(orchestrator.last_trace)
         await cl.Message(content=f"分析失败：{exc}").send()
         return
 
+    await _show_trace(orchestrator.last_trace)
+    elements = _trace_elements(orchestrator.last_trace)
     if isinstance(result, DictionaryAnswer):
-        await cl.Message(content=result.text).send()
+        await cl.Message(content=result.text, elements=elements).send()
         return
 
     assert isinstance(result, Answer)
@@ -186,24 +186,33 @@ async def on_message(message: cl.Message) -> None:
             f"```sql\n{result.sql}\n```\n\n"
             "**结果**\n"
             f"```\n{format_result_table(result.dataframe)}\n```"
-        )
+        ),
+        elements=elements,
     ).send()
 
 
-def _step_output(result: Answer | Clarification | DictionaryAnswer) -> str:
-    if isinstance(result, Clarification):
-        return result.request.question
-    if isinstance(result, DictionaryAnswer):
-        return result.text
-    output = result.sql
-    if result.repaired:
-        output += f"\n（第 {result.attempts} 次尝试成功）"
-        if result.repair_history:
-            history = "\n".join(
-                f"- 第 {item.attempt} 次：{item.error}" for item in result.repair_history
-            )
-            output += f"\n修复记录：\n{history}"
-    return output
+async def _show_trace(trace: Trace | None) -> None:
+    """按 trace 渲染嵌套步骤时间线；详细面板在回答末尾的侧栏展示。"""
+    # DEBT-020: 步骤在整轮分析完成后一次性渲染, 暂不提供 token 级实时反馈。
+    if trace is None or not trace.steps:
+        return
+    async with cl.Step(name="分析过程", type="tool", auto_collapse=True) as parent:
+        parent.output = f"共 {len(trace.steps)} 步"
+        for item in trace.steps:
+            async with cl.Step(name=item.name, type="tool") as step:
+                step.output = item.detail or item.summary
+
+
+def _trace_elements(trace: Trace | None) -> list[Any]:
+    if trace is None or not trace.steps:
+        return []
+    return [
+        cl.Text(
+            name="透明面板",
+            content=trace.to_panel_markdown(),
+            display="side",
+        )
+    ]
 
 
 def _selected_value(response: Any) -> str | None:

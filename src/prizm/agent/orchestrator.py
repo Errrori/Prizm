@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -11,10 +12,16 @@ import pandas as pd
 from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
 from prizm.agent.memory import ConversationMemory, Turn
 from prizm.agent.planner import Planner
-from prizm.agent.repair import RepairAttempt, Repairer
+from prizm.agent.repair import RepairAttempt, Repairer, RepairFailed
+from prizm.agent.trace import (
+    ProfileReference,
+    Trace,
+    TraceStep,
+    policy_label,
+)
 from prizm.datasource.base import BaseConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
-from prizm.profiling.models import ProfileReport
+from prizm.profiling.models import Anomaly, ProfileReport
 from prizm.profiling.profiler import ProfileOptions, profile_frame
 from prizm.rag.retriever import DictionaryAnswer, DictionaryQA, is_dictionary_question
 
@@ -29,6 +36,7 @@ class Answer:
     chart: dict[str, Any] | None = None
     attempts: int = 1
     repair_history: tuple[RepairAttempt, ...] = ()
+    trace: Trace | None = None
 
     @property
     def empty(self) -> bool:
@@ -44,6 +52,7 @@ class Clarification:
     question: str
     request: ClarificationRequest
     remaining: int = 0
+    trace: Trace | None = None
 
 
 @dataclass
@@ -100,6 +109,7 @@ class Orchestrator:
         self.view_name = connector.view_name
         self._clarify_gate = clarify_gate or ClarifyGate()
         self._pending: _PendingClarification | None = None
+        self._last_trace: Trace | None = None
 
     @property
     def dataframe(self) -> pd.DataFrame:
@@ -113,6 +123,11 @@ class Orchestrator:
     def history(self) -> tuple[Turn, ...]:
         return self._memory.turns
 
+    @property
+    def last_trace(self) -> Trace | None:
+        """最近一次 ask/resolve 的透明 trace，供 UI 展示。"""
+        return self._last_trace
+
     def attach_dictionary(self, dictionary_qa: DictionaryQA | None) -> None:
         """挂载/替换数据字典问答；None 表示关闭 RAG 路由。"""
         self._dictionary_qa = dictionary_qa
@@ -121,7 +136,7 @@ class Orchestrator:
     def pending_clarification(self) -> Clarification | None:
         if self._pending is None:
             return None
-        return self._as_clarification(self._pending)
+        return self._as_clarification(self._pending, self._last_trace)
 
     def ask(self, question: str) -> Answer | Clarification | DictionaryAnswer:
         if not question.strip():
@@ -130,7 +145,20 @@ class Orchestrator:
             raise RuntimeError("存在未完成的澄清，请先回答澄清问题")
         text = question.strip()
         if self._dictionary_qa is not None and is_dictionary_question(text):
-            return self._dictionary_qa.answer(text)
+            answer = self._dictionary_qa.answer(text)
+            self._last_trace = Trace(
+                question=text,
+                steps=(
+                    TraceStep("路由判定", "ok", "命中数据字典术语问题，走检索而非 SQL"),
+                    TraceStep(
+                        "字典检索",
+                        "ok",
+                        f"返回 {len(answer.citations)} 条可溯源片段",
+                        detail=answer.text,
+                    ),
+                ),
+            )
+            return answer
         return self._advance(text)
 
     def resolve(self, value: str) -> Answer | Clarification:
@@ -144,38 +172,150 @@ class Orchestrator:
             option.label,
             question=pending.question,
         )
-        pending.advance()
-        if not pending.done:
-            return self._as_clarification(pending)
-        self._pending = None
-        return self._advance(pending.question)
-
-    def _advance(self, question: str) -> Answer | Clarification:
-        decision = self._clarify_gate.judge(question, self._profile)
-        if decision.needs_clarification:
-            self._pending = _PendingClarification(question, decision.requests)
-            return self._as_clarification(self._pending)
-        return self._execute(question)
-
-    def _execute(self, question: str) -> Answer:
-        policies = self._clarify_gate.policy_summary()
-        outcome = self._repairer.run(
-            question,
-            self.view_name,
-            self._frame,
-            profile_summary=self._profile.to_prompt(
-                max_chars=self._profile_options.max_prompt_chars
-            ),
-            confirmed_policies=policies or None,
-            conversation_summary=self._memory.format_for_prompt(),
+        policy_name = policy_label(pending.current.code)
+        step = TraceStep(
+            "按确认口径处理",
+            "ok",
+            f"{policy_name}：{option.label}",
+            detail=option.description or None,
         )
+        prior_steps: list[TraceStep] = []
+        prior_references: tuple[ProfileReference, ...] = ()
+        if self._last_trace is not None and self._last_trace.question == pending.question:
+            prior_steps = list(self._last_trace.steps)
+            prior_references = self._last_trace.profile_references
+        steps = [*prior_steps, step]
+        pending.advance()
+        references = _merge_references(
+            prior_references,
+            _profile_references(self._profile, pending.requests),
+        )
+        if not pending.done:
+            trace = self._clarification_trace(pending, steps, references)
+            self._last_trace = trace
+            return self._as_clarification(pending, trace)
+        self._pending = None
+        return self._advance(pending.question, steps, references)
+
+    def _advance(
+        self,
+        question: str,
+        prior_steps: Sequence[TraceStep] = (),
+        prior_references: Sequence[ProfileReference] = (),
+    ) -> Answer | Clarification:
+        decision = self._clarify_gate.judge(question, self._profile)
+        steps = list(prior_steps)
+        references = _merge_references(
+            tuple(prior_references),
+            _profile_references(self._profile, decision.requests),
+        )
+        if decision.needs_clarification:
+            reasons = "；".join(request.reason for request in decision.requests)
+            steps.append(
+                TraceStep(
+                    "体检与澄清判定",
+                    "clarify",
+                    f"触发 {len(decision.requests)} 项澄清，暂不执行",
+                    detail=reasons,
+                )
+            )
+            self._pending = _PendingClarification(question, decision.requests)
+            trace = self._clarification_trace(self._pending, steps, references)
+            self._last_trace = trace
+            return self._as_clarification(self._pending, trace)
+        steps.append(
+            TraceStep(
+                "体检与澄清判定",
+                "ok",
+                f"体检 {len(self._profile.anomalies)} 条异常，无新增待澄清项，进入规划",
+            )
+        )
+        return self._execute(question, steps, references)
+
+    def _execute(
+        self,
+        question: str,
+        prior_steps: Sequence[TraceStep] = (),
+        references: Sequence[ProfileReference] = (),
+    ) -> Answer:
+        policies = self._clarify_gate.policy_summary()
+        steps = list(prior_steps)
+        start = time.perf_counter()
+        try:
+            outcome = self._repairer.run(
+                question,
+                self.view_name,
+                self._frame,
+                profile_summary=self._profile.to_prompt(
+                    max_chars=self._profile_options.max_prompt_chars
+                ),
+                confirmed_policies=policies or None,
+                conversation_summary=self._memory.format_for_prompt(),
+            )
+        except RepairFailed as exc:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            failed_sql = exc.history[-1].sql if exc.history else None
+            steps.append(
+                TraceStep(
+                    "SQL 规划与执行",
+                    "failed",
+                    f"已尝试 {exc.attempts} 次仍未成功",
+                    detail=_format_repair_history(exc.history) or exc.last_error,
+                )
+            )
+            self._last_trace = Trace(
+                question=question,
+                steps=tuple(steps),
+                generated_sql=failed_sql,
+                execution_status="failed",
+                profile_references=tuple(references),
+                confirmed_policies=tuple(policies.items()),
+                attempts=exc.attempts,
+                elapsed_ms=elapsed_ms,
+            )
+            raise
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        steps.append(
+            TraceStep("SQL 规划", "ok", "已生成只读 SQL", detail=outcome.plan.sql)
+        )
+        if outcome.attempts > 1:
+            steps.append(
+                TraceStep(
+                    "自修复",
+                    "repaired",
+                    f"第 {outcome.attempts} 次尝试成功",
+                    detail=_format_repair_history(outcome.history) or None,
+                )
+            )
+        dataframe = outcome.dataframe
+        steps.append(
+            TraceStep(
+                "执行",
+                "ok",
+                f"返回 {len(dataframe)} 行 × {len(dataframe.columns)} 列",
+            )
+        )
+        trace = Trace(
+            question=question,
+            steps=tuple(steps),
+            generated_sql=outcome.plan.sql,
+            execution_status="repaired" if outcome.attempts > 1 else "succeeded",
+            profile_references=tuple(references),
+            confirmed_policies=tuple(policies.items()),
+            attempts=outcome.attempts,
+            elapsed_ms=elapsed_ms,
+        )
+        self._last_trace = trace
+
         answer = Answer(
             question=question,
             sql=outcome.plan.sql,
-            dataframe=outcome.dataframe,
+            dataframe=dataframe,
             chart=outcome.plan.chart,
             attempts=outcome.attempts,
             repair_history=outcome.history,
+            trace=trace,
         )
         self._memory.add(
             Turn(
@@ -194,13 +334,85 @@ class Orchestrator:
         )
         return answer
 
+    def _clarification_trace(
+        self,
+        pending: _PendingClarification,
+        steps: Sequence[TraceStep],
+        references: Sequence[ProfileReference] = (),
+    ) -> Trace:
+        return Trace(
+            question=pending.question,
+            steps=tuple(steps),
+            execution_status="not_run",
+            profile_references=tuple(references),
+            confirmed_policies=tuple(self._clarify_gate.policy_summary().items()),
+        )
+
     @staticmethod
-    def _as_clarification(pending: _PendingClarification) -> Clarification:
+    def _as_clarification(
+        pending: _PendingClarification,
+        trace: Trace | None = None,
+    ) -> Clarification:
         return Clarification(
             question=pending.question,
             request=pending.current,
             remaining=pending.remaining_after,
+            trace=trace,
         )
+
+
+def _profile_references(
+    profile: ProfileReport,
+    requests: Sequence[ClarificationRequest],
+) -> tuple[ProfileReference, ...]:
+    references: list[ProfileReference] = []
+    for request in requests:
+        matched = [
+            anomaly
+            for anomaly in profile.anomalies
+            if _request_matches_anomaly(request, anomaly)
+        ]
+        if not matched:
+            continue
+        references.append(
+            ProfileReference(
+                code=request.code,
+                column=request.column,
+                count=sum(anomaly.count for anomaly in matched),
+                reason=request.reason,
+            )
+        )
+    return tuple(references)
+
+
+def _request_matches_anomaly(request: ClarificationRequest, anomaly: Anomaly) -> bool:
+    if request.code != anomaly.code:
+        return False
+    if not request.column or not anomaly.column:
+        return True
+    columns = {part.strip() for part in request.column.split("/") if part.strip()}
+    return anomaly.column in columns
+
+
+def _merge_references(
+    *groups: Sequence[ProfileReference],
+) -> tuple[ProfileReference, ...]:
+    merged: list[ProfileReference] = []
+    seen: set[tuple[str, str | None, str]] = set()
+    for group in groups:
+        for reference in group:
+            key = (reference.code, reference.column, reference.reason)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(reference)
+    return tuple(merged)
+
+
+def _format_repair_history(history: Sequence[RepairAttempt]) -> str:
+    return "\n".join(
+        f"- 第 {item.attempt} 次：{item.error}" for item in history
+    )
 
 
 def _match_option(request: ClarificationRequest, value: str) -> ClarificationOption:

@@ -26,10 +26,18 @@ _RETRYABLE_ERRORS = (PlanParseError, SQLValidationError, QueryTimeoutError, duck
 class RepairFailed(RuntimeError):
     """达到最大尝试次数后仍无法执行。"""
 
-    def __init__(self, *, question: str, attempts: int, last_error: str) -> None:
+    def __init__(
+        self,
+        *,
+        question: str,
+        attempts: int,
+        last_error: str,
+        history: tuple[RepairAttempt, ...] = (),
+    ) -> None:
         self.question = question
         self.attempts = attempts
         self.last_error = last_error
+        self.history = history
         super().__init__(f"共尝试 {attempts} 次后仍失败：{last_error}")
 
 
@@ -129,6 +137,7 @@ class Repairer:
                         question=question,
                         attempts=attempt,
                         last_error=last_error,
+                        history=tuple(history),
                     ) from exc
                 feedback = build_repair_feedback(
                     attempt=attempt,

@@ -13,6 +13,8 @@ from prizm.agent.orchestrator import (
     format_result_table,
 )
 from prizm.agent.planner import Planner
+from prizm.agent.repair import RepairFailed
+from prizm.agent.trace import Trace
 from prizm.datasource.csv_connector import CsvConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
 from prizm.llm.adapter import Completion, Message, MockLLM
@@ -87,6 +89,16 @@ def test_orchestrator_runs_plan_end_to_end(tmp_path: Path) -> None:
     assert answer.empty is False
     assert llm.calls
 
+    assert isinstance(answer.trace, Trace)
+    assert answer.trace.execution_status == "succeeded"
+    assert answer.trace.generated_sql == answer.sql
+    assert [step.name for step in answer.trace.steps] == [
+        "体检与澄清判定",
+        "SQL 规划",
+        "执行",
+    ]
+    assert orchestrator.last_trace is answer.trace
+
 
 def test_orchestrator_repairs_after_sql_error(tmp_path: Path) -> None:
     path = tmp_path / "orders.csv"
@@ -112,6 +124,11 @@ def test_orchestrator_repairs_after_sql_error(tmp_path: Path) -> None:
     assert "missing_column" in answer.repair_history[0].error
     assert int(answer.dataframe.loc[0, "total"]) == 300
     assert "上一次尝试失败" in llm.calls[1][1]["content"]
+
+    assert isinstance(answer.trace, Trace)
+    assert answer.trace.execution_status == "repaired"
+    assert answer.trace.attempts == 2
+    assert [step.name for step in answer.trace.steps][-2:] == ["自修复", "执行"]
 
 
 def test_orchestrator_reuses_dataset_and_injects_history(tmp_path: Path) -> None:
@@ -163,10 +180,14 @@ def test_orchestrator_routes_dictionary_questions_without_calling_llm(tmp_path: 
     with DuckDBEngine() as engine:
         orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm), dictionary_qa=qa)
         dictionary_answer = orchestrator.ask("sales 是什么意思？")
+        dictionary_trace = orchestrator.last_trace
         analysis_answer = orchestrator.ask("已完成订单的销售额是多少？")
 
     assert isinstance(dictionary_answer, DictionaryAnswer)
     assert dictionary_answer.citations[0].column == "sales"
+    assert dictionary_trace is not None
+    assert dictionary_trace.execution_status == "not_run"
+    assert [step.name for step in dictionary_trace.steps] == ["路由判定", "字典检索"]
     assert llm.calls[0][1]["content"].endswith("已完成订单的销售额是多少？")
     assert len(llm.calls) == 1
     assert isinstance(analysis_answer, Answer)
@@ -221,6 +242,10 @@ def test_orchestrator_returns_clarification_without_planning(tmp_path: Path) -> 
     assert isinstance(result, Clarification)
     assert llm.calls == []
     assert orchestrator.pending_clarification is not None
+    assert isinstance(result.trace, Trace)
+    assert result.trace.execution_status == "not_run"
+    assert result.trace.profile_references
+    assert result.trace.steps[-1].status == "clarify"
 
 
 def test_orchestrator_executes_after_all_clarifications(tmp_path: Path) -> None:
@@ -243,6 +268,18 @@ def test_orchestrator_executes_after_all_clarifications(tmp_path: Path) -> None:
     prompt = llm.calls[0][1]["content"]
     assert "用户已确认的数据口径" in prompt
     assert result.sql == "SELECT 1 AS ok"
+
+    assert isinstance(result.trace, Trace)
+    assert result.trace.execution_status == "succeeded"
+    assert {reference.code for reference in result.trace.profile_references} >= {
+        "duplicate_primary_key",
+        "missing_values",
+        "dirty_numeric_format",
+    }
+    assert any(
+        name == "数值脏格式" for name, _ in result.trace.confirmed_policies
+    )
+    assert [step.name for step in result.trace.steps].count("按确认口径处理") == rounds
 
 
 def test_orchestrator_rejects_invalid_clarification_option(tmp_path: Path) -> None:
@@ -278,3 +315,23 @@ def test_orchestrator_resolve_without_pending_raises(tmp_path: Path) -> None:
 
         with pytest.raises(RuntimeError, match="没有待澄清"):
             orchestrator.resolve("dedupe_keep_first")
+
+def test_orchestrator_records_failed_trace_when_repair_exhausted(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    bad_sql = "SELECT missing_column FROM orders"
+    llm = SequenceLLM([json.dumps({"sql": bad_sql, "chart": None})] * 3)
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(CsvConnector(path), engine, Planner(llm))
+        with pytest.raises(RepairFailed, match="共尝试 3 次"):
+            orchestrator.ask("已完成订单的销售额是多少？")
+
+    trace = orchestrator.last_trace
+    assert trace is not None
+    assert trace.execution_status == "failed"
+    assert trace.attempts == 3
+    assert trace.generated_sql == bad_sql
+    assert trace.steps[-1].name == "SQL 规划与执行"
+    assert trace.steps[-1].status == "failed"
+    assert "missing_column" in (trace.steps[-1].detail or "")

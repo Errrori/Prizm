@@ -10,7 +10,7 @@
 ---
 
 ## 当前阶段
-阶段 P2：透明面板（trace + Chainlit 嵌套 Step + 侧栏面板）已完成；下一步真实模型评测与交付物
+阶段 P2 与 MVP 数据源已闭环（CSV/Excel/SQLite）；下一步结果呈现（图表 + 结论）
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -22,16 +22,19 @@
 - 任务 3-1/3-2：P1 自修复（总尝试 ≤3，还清 DEBT-001）、评测执行入口
 - 任务 4-1：多轮上下文，数据集只加载一次并注入历史摘要
 - 任务 5-1/5-2：RAG 数据字典 + 50 条术语评测（引用溯源 50/50）
-- 2026-11-23 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、Orchestrator 记录各阶段、Chainlit 嵌套 Step + 侧栏面板；256 项 pytest 全绿
+- 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、各阶段记录、Chainlit 嵌套 Step + 侧栏面板
+- 任务 7-1：Excel(.xlsx) / SQLite connector + 上传端多 sheet/多表选择；268 项 pytest 全绿
 
 ## 进行中
 - 无
 
 ## 下一步
-- 真实模型评测：网络/key 恢复后验证一次成功率 ≥75%、自修复后 ≥90%
+- 结果呈现模块：chart spec → matplotlib PNG + LLM 结论（失败回退模板文本）
+- 真实模型评测：验证一次成功率 ≥75%、自修复后 ≥90%
 - 交付物：README（架构图/演示/评测表）与 Dockerfile 复核
 
 ## 阻塞与风险
+- 非阻塞：DEBT-021 Excel/SQLite 仅单表整表读取；不支持 .xls、多表关联、视图与多级表头
 - 非阻塞：DEBT-020 透明面板为执行后一次性渲染，未提供流式过程反馈
 - 非阻塞：DEBT-019 RAG 评测集为模板生成；DEBT-016 路由启发式；DEBT-017 问答未用 LLM 归纳；DEBT-018 50 条 QA 评测待建
 - 非阻塞：DEBT-014 评测多轮未串上下文；DEBT-015 多轮记忆未缓存可查询结果

@@ -1,7 +1,8 @@
-"""Chainlit 入口：上传 CSV → 注册 DuckDB → 体检 → 澄清门禁 → 提问 → 展示结果。"""
+"""Chainlit 入口：上传 CSV/Excel/SQLite → 注册 DuckDB → 体检 → 澄清门禁 → 提问 → 展示结果。"""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import chainlit as cl
@@ -18,7 +19,10 @@ from prizm.agent.planner import Planner, build_mock_plan_response
 from prizm.agent.repair import RepairFailed
 from prizm.agent.trace import Trace
 from prizm.config import get_settings
+from prizm.datasource.base import BaseConnector
 from prizm.datasource.csv_connector import CsvConnector
+from prizm.datasource.excel_connector import ExcelConnector, list_excel_sheets
+from prizm.datasource.sqlite_connector import SqliteConnector, list_sqlite_tables
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError
 from prizm.llm.adapter import LLMError, build_llm
 from prizm.profiling.profiler import format_profile_report
@@ -33,8 +37,17 @@ _usage_ledger = DailyUsageLedger()
 async def on_chat_start() -> None:
     settings = get_settings()
     files = await cl.AskFileMessage(
-        content="请上传一个 CSV 文件，可选同时上传 .md/.txt 数据说明文档。",
-        accept=["text/csv", "text/markdown", "text/plain"],
+        content=(
+            "请上传一个数据文件（CSV / Excel .xlsx / SQLite），"
+            "可选同时上传 .md/.txt 数据说明文档。"
+        ),
+        accept={
+            "text/csv": [".csv"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+            "application/octet-stream": [".sqlite", ".sqlite3", ".db"],
+            "text/markdown": [".md"],
+            "text/plain": [".txt"],
+        },
         max_files=2,
         max_size_mb=50,
     ).send()
@@ -42,13 +55,19 @@ async def on_chat_start() -> None:
         await cl.Message(content="未收到文件，已取消。").send()
         return
 
-    csv_files = [file for file in files if file.name.lower().endswith(".csv")]
-    if len(csv_files) != 1:
-        await cl.Message(content="请上传且只上传一个 CSV 文件。").send()
+    data_files = [
+        file
+        for file in files
+        if file.name.lower().endswith((".csv", ".xlsx", ".sqlite", ".sqlite3", ".db"))
+    ]
+    if len(data_files) != 1:
+        await cl.Message(
+            content="请上传且只上传一个数据文件（CSV / Excel .xlsx / SQLite）。"
+        ).send()
         return
-    uploaded = csv_files[0]
+    uploaded = data_files[0]
     if uploaded.path is None:
-        await cl.Message(content="CSV 文件尚未落地到本地，无法读取。").send()
+        await cl.Message(content="数据文件尚未落地到本地，无法读取。").send()
         return
 
     doc_files = [
@@ -70,10 +89,14 @@ async def on_chat_start() -> None:
             return
 
     try:
-        connector = CsvConnector(uploaded.path, view_name=uploaded.name)
-    except ValueError as exc:
-        await cl.Message(content=f"读取 CSV 失败：{exc}").send()
+        selection = await _build_connector(uploaded)
+    except (OSError, ValueError) as exc:
+        await cl.Message(content=f"读取数据源失败：{exc}").send()
         return
+    if selection is None:
+        await cl.Message(content="未选择数据表，已取消。").send()
+        return
+    connector, source_label = selection
 
     engine = DuckDBEngine(
         memory_limit=settings.duckdb_memory_limit,
@@ -95,7 +118,7 @@ async def on_chat_start() -> None:
     generated_entries = build_data_dictionary(
         orchestrator.dataframe,
         profile=orchestrator.profile,
-        source=uploaded.name,
+        source=source_label,
     )
     dictionary_entries = (*generated_entries, *doc_entries)
     orchestrator.attach_dictionary(DictionaryQA(DataDictionaryRetriever(dictionary_entries)))
@@ -106,7 +129,7 @@ async def on_chat_start() -> None:
     mode = "mock（未配置真实模型）" if settings.is_mock else settings.default_model
     await cl.Message(
         content=(
-            f"已加载 `{uploaded.name}`：{len(frame)} 行 × {len(frame.columns)} 列。\n"
+            f"已加载 `{source_label}`：{len(frame)} 行 × {len(frame.columns)} 列。\n"
             f"当前模型：{mode}。\n"
             f"数据字典：{len(dictionary_entries)} 条"
             f"（文档 {len(doc_entries)} 条）。\n\n"
@@ -119,7 +142,7 @@ async def on_chat_start() -> None:
 async def on_message(message: cl.Message) -> None:
     orchestrator: Orchestrator | None = cl.user_session.get("orchestrator")
     if orchestrator is None:
-        await cl.Message(content="请先上传 CSV 文件。").send()
+        await cl.Message(content="请先上传数据文件。").send()
         return
 
     settings = get_settings()
@@ -189,6 +212,67 @@ async def on_message(message: cl.Message) -> None:
         ),
         elements=elements,
     ).send()
+
+
+async def _build_connector(uploaded: Any) -> tuple[BaseConnector, str] | None:
+    """按后缀构建 connector；Excel 多 sheet / SQLite 多表时让用户选择。"""
+    if uploaded.path is None:
+        raise ValueError("文件尚未落地到本地，无法读取")
+    path = uploaded.path
+    name = uploaded.name
+    lower = name.lower()
+
+    if lower.endswith(".csv"):
+        return CsvConnector(path, view_name=name), name
+
+    if lower.endswith(".xlsx"):
+        sheets = list_excel_sheets(path)
+        if not sheets:
+            raise ValueError(f"Excel 文件没有工作表: {name}")
+        sheet = sheets[0]
+        if len(sheets) > 1:
+            chosen = await _ask_choice(
+                f"`{name}` 有 {len(sheets)} 个工作表，请选择一个：",
+                [(item, item) for item in sheets],
+            )
+            if chosen is None:
+                return None
+            sheet = chosen
+        return ExcelConnector(path, view_name=name, sheet_name=sheet), (
+            f"{name}（工作表：{sheet}）"
+        )
+
+    if lower.endswith((".sqlite", ".sqlite3", ".db")):
+        tables = list_sqlite_tables(path)
+        if not tables:
+            raise ValueError(f"SQLite 文件没有可读取的数据表: {name}")
+        table = tables[0]
+        if len(tables) > 1:
+            chosen = await _ask_choice(
+                f"`{name}` 有 {len(tables)} 张表，请选择一张：",
+                [(item, item) for item in tables],
+            )
+            if chosen is None:
+                return None
+            table = chosen
+        return SqliteConnector(path, view_name=table, table=table), (
+            f"{name}（数据表：{table}）"
+        )
+
+    if lower.endswith(".xls"):
+        raise ValueError("暂不支持旧版 .xls，请另存为 .xlsx 后重试")
+    raise ValueError(f"不支持的文件类型: {name}")
+
+
+async def _ask_choice(title: str, options: Sequence[tuple[str, str]]) -> str | None:
+    response = await cl.AskActionMessage(
+        content=title,
+        actions=[
+            cl.Action(name=value, payload={"value": value}, label=label)
+            for value, label in options
+        ],
+    ).send()
+    return _selected_value(response)
 
 
 async def _show_trace(trace: Trace | None) -> None:

@@ -208,3 +208,12 @@
 - 登记日期：2026-11-23
 - 还清记录：—
 
+### DEBT-021 Excel/SQLite 数据源仅支持单表整表读取
+- 状态：未还
+- 现状：Excel 仅支持 `.xlsx` 且一次只读一个 sheet（默认表头，不处理合并单元格/多级表头）；SQLite 用 stdlib 只读连接一次读入一张用户表，不支持视图、附加库或多表关联；两者都整表读入内存。
+- 为什么简化：Orchestrator 当前只持有单个 DataFrame，先验证 Connector 抽象与常见上传场景，避免引入多关系执行和 `.xls` 可选依赖。
+- 触发条件：接入真实用户 Excel/SQLite 后出现多 sheet 汇总、多表关联、视图读取或大表内存不足。
+- 涉及文件：src/prizm/datasource/excel_connector.py, src/prizm/datasource/sqlite_connector.py, app/main.py
+- 登记日期：2026-11-23
+- 还清记录：—
+

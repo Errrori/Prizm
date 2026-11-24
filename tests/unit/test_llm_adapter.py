@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -310,3 +311,86 @@ def test_build_llm_rejects_mismatched_provider_key(
 
     with pytest.raises(LLMConfigError, match="DASHSCOPE_API_KEY"):
         build_llm(settings)
+
+
+def make_stream_chunk(
+    content: str | None,
+    *,
+    usage: tuple[int, int, int] | None = None,
+    cost: float | None = None,
+) -> SimpleNamespace:
+    choices = (
+        []
+        if content is None
+        else [SimpleNamespace(delta=SimpleNamespace(content=content))]
+    )
+    prompt, completion, total = usage or (0, 0, 0)
+    hidden = {} if cost is None else {"response_cost": cost}
+    return SimpleNamespace(
+        choices=choices,
+        usage=SimpleNamespace(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total,
+        ),
+        _hidden_params=hidden,
+    )
+
+
+def test_mock_llm_streams_in_pieces() -> None:
+    llm = MockLLM("销售额合计 300。")
+
+    chunks = list(llm.stream([{"role": "user", "content": "hi"}]))
+
+    assert "".join(chunks) == "销售额合计 300。"
+    assert len(chunks) > 1
+    assert llm.calls == [[{"role": "user", "content": "hi"}]]
+
+
+def test_litellm_adapter_streams_and_records_usage() -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_completion(**kwargs: Any) -> Iterator[SimpleNamespace]:
+        captured.update(kwargs)
+        yield make_stream_chunk("销售")
+        yield make_stream_chunk("额")
+        yield make_stream_chunk(" 300。")
+        yield make_stream_chunk(None, usage=(10, 5, 15), cost=0.002)
+
+    ledger = DailyUsageLedger()
+    adapter = LiteLLMAdapter(
+        "gpt-test",
+        api_key="k",
+        completion_fn=fake_completion,
+        ledger=ledger,
+        daily_token_budget=1000,
+    )
+
+    text = "".join(adapter.stream([{"role": "user", "content": "hi"}]))
+
+    assert text == "销售额 300。"
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
+    assert ledger.snapshot().total_tokens == 15
+    assert ledger.snapshot().cost_usd == pytest.approx(0.002)
+
+
+def test_litellm_adapter_stream_raises_on_empty() -> None:
+    def fake_completion(**kwargs: Any) -> Iterator[SimpleNamespace]:
+        yield make_stream_chunk(None)
+
+    adapter = LiteLLMAdapter("gpt-test", api_key="k", completion_fn=fake_completion)
+
+    with pytest.raises(LLMError, match="为空"):
+        list(adapter.stream([{"role": "user", "content": "hi"}]))
+
+
+def test_litellm_adapter_wraps_stream_errors() -> None:
+    def fake_completion(**kwargs: Any) -> Iterator[SimpleNamespace]:
+        raise RuntimeError("boom")
+        yield  # pragma: no cover
+
+    adapter = LiteLLMAdapter("gpt-test", api_key="k", completion_fn=fake_completion)
+
+    with pytest.raises(LLMError, match="流式调用失败"):
+        list(adapter.stream([{"role": "user", "content": "hi"}]))

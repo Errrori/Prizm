@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -117,15 +118,41 @@ class ConclusionComposer:
         frame: pd.DataFrame,
         *,
         chart: ChartSpec | None = None,
+        on_token: Callable[[str], None] | None = None,
     ) -> Conclusion:
+        messages = build_conclusion_prompt(question, sql, frame, chart=chart)
+        if on_token is not None:
+            stream_llm = getattr(self.llm, "stream", None)
+            if callable(stream_llm):
+                return self._compose_stream(stream_llm, messages, frame, on_token)
         try:
-            completion = self.llm.complete(
-                build_conclusion_prompt(question, sql, frame, chart=chart)
-            )
+            completion = self.llm.complete(messages)
             return Conclusion(clean_conclusion(completion.text), source="llm")
         except (LLMError, QuotaExceededError, ValueError) as exc:
-            return Conclusion(
-                template_conclusion(frame),
-                source="template",
-                fallback_reason=str(exc) or exc.__class__.__name__,
-            )
+            return _fallback(frame, exc)
+
+    def _compose_stream(
+        self,
+        stream_llm: Callable[[Sequence[Message]], Iterator[str]],
+        messages: Sequence[Message],
+        frame: pd.DataFrame,
+        on_token: Callable[[str], None],
+    ) -> Conclusion:
+        try:
+            parts: list[str] = []
+            for chunk in stream_llm(messages):
+                if not chunk:
+                    continue
+                parts.append(chunk)
+                on_token(chunk)
+            return Conclusion(clean_conclusion("".join(parts)), source="llm")
+        except (LLMError, QuotaExceededError, ValueError) as exc:
+            return _fallback(frame, exc)
+
+
+def _fallback(frame: pd.DataFrame, exc: Exception) -> Conclusion:
+    return Conclusion(
+        template_conclusion(frame),
+        source="template",
+        fallback_reason=str(exc) or exc.__class__.__name__,
+    )

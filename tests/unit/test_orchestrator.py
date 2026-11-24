@@ -14,6 +14,7 @@ from prizm.agent.orchestrator import (
     format_result_table,
 )
 from prizm.agent.planner import Planner
+from prizm.agent.progress import ProgressEvent
 from prizm.agent.repair import RepairFailed
 from prizm.agent.trace import Trace
 from prizm.datasource.csv_connector import CsvConnector
@@ -442,3 +443,42 @@ def test_orchestrator_falls_back_to_template_when_conclusion_fails(tmp_path: Pat
     conclusion_step = next(step for step in answer.trace.steps if step.name == "结论生成")
     assert conclusion_step.status == "fallback"
     assert "模型超时" in (conclusion_step.detail or "")
+
+
+@dataclass
+class StreamConclusionLLM:
+    chunks: list[str]
+    calls: list[list[Message]] = field(default_factory=list)
+
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        raise AssertionError("启用流式时不应回退到 complete")
+
+    def stream(self, messages: Sequence[Message], *, temperature: float = 0.0):
+        self.calls.append([dict(message) for message in messages])
+        yield from self.chunks
+
+
+def test_orchestrator_emits_progress_events(tmp_path: Path) -> None:
+    path = tmp_path / "orders.csv"
+    write_orders(path)
+    sql = "SELECT SUM(sales) AS total FROM orders WHERE status = '已完成'"
+    planner_llm = MockLLM(json.dumps({"sql": sql, "chart": None}))
+    composer_llm = StreamConclusionLLM(["销售额", "合计 300。"])
+    events: list[ProgressEvent] = []
+
+    with DuckDBEngine() as engine:
+        orchestrator = Orchestrator(
+            CsvConnector(path),
+            engine,
+            Planner(planner_llm),
+            conclusion_composer=ConclusionComposer(composer_llm),
+        )
+        answer = orchestrator.ask("已完成订单的销售额是多少？", progress=events.append)
+
+    step_names = [event.name for event in events if event.kind == "step"]
+    assert step_names == ["体检与澄清判定", "SQL 规划", "执行", "结论生成"]
+
+    tokens = "".join(event.text for event in events if event.kind == "conclusion_token")
+    assert tokens == "销售额合计 300。"
+    assert answer.conclusion == "销售额合计 300。"
+    assert answer.conclusion_source == "llm"

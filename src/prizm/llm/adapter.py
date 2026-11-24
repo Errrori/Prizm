@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -30,6 +30,17 @@ class LLMAdapter(Protocol):
     def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion: ...
 
 
+class StreamingLLM(Protocol):
+    """可选能力：逐块产出文本；是否实现由适配器决定，业务侧按需探测。"""
+
+    def stream(
+        self, messages: Sequence[Message], *, temperature: float = 0.0
+    ) -> Iterator[str]: ...
+
+
+_STREAM_PIECE_SIZE = 4
+
+
 @dataclass
 class MockLLM:
     """固定返回一段文本，用于无 key 的开发与单测。"""
@@ -40,6 +51,13 @@ class MockLLM:
     def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
         self.calls.append([dict(message) for message in messages])
         return Completion(self.response)
+
+    def stream(
+        self, messages: Sequence[Message], *, temperature: float = 0.0
+    ) -> Iterator[str]:
+        self.calls.append([dict(message) for message in messages])
+        for start in range(0, len(self.response), _STREAM_PIECE_SIZE):
+            yield self.response[start : start + _STREAM_PIECE_SIZE]
 
 
 def _read_field(source: Any, name: str) -> Any:
@@ -78,6 +96,16 @@ def extract_usage(response: Any) -> Usage:
     )
 
 
+def _extract_stream_text(chunk: Any) -> str | None:
+    """从流式 chunk 中取出增量文本；无内容或结构缺失时返回 None。"""
+    choices = _read_field(chunk, "choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
+        return None
+    delta = _read_field(choices[0], "delta")
+    content = _read_field(delta, "content")
+    return content if isinstance(content, str) and content else None
+
+
 def _configure_litellm_env() -> None:
     """隔离 litellm 的进程默认值：不读 CWD .env，也不联网拉成本表。"""
     os.environ.setdefault("LITELLM_MODE", "PROD")
@@ -110,10 +138,9 @@ class LiteLLMAdapter:
 
         return cast(CompletionFn, completion)
 
-    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
-        if self.ledger is not None and self.daily_token_budget is not None:
-            self.ledger.ensure_available(self.daily_token_budget)
-
+    def _request_kwargs(
+        self, messages: Sequence[Message], temperature: float
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
@@ -125,8 +152,16 @@ class LiteLLMAdapter:
             kwargs["api_base"] = self.api_base
         if self.max_retries > 0:
             kwargs["num_retries"] = self.max_retries
+        return kwargs
+
+    def _ensure_quota(self) -> None:
+        if self.ledger is not None and self.daily_token_budget is not None:
+            self.ledger.ensure_available(self.daily_token_budget)
+
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        self._ensure_quota()
         try:
-            response = self._completion()(**kwargs)
+            response = self._completion()(**self._request_kwargs(messages, temperature))
         except Exception as exc:
             raise LLMError(f"LLM 调用失败: {exc}") from exc
 
@@ -141,6 +176,40 @@ class LiteLLMAdapter:
         if not isinstance(content, str) or not content.strip():
             raise LLMError("LLM 返回内容为空")
         return Completion(content, usage)
+
+    def stream(
+        self, messages: Sequence[Message], *, temperature: float = 0.0
+    ) -> Iterator[str]:
+        """逐块产出文本；usage 取流末尾（需 provider 支持 include_usage）。"""
+        self._ensure_quota()
+        kwargs = self._request_kwargs(messages, temperature)
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+        usage: Usage | None = None
+        emitted_chars = 0
+        try:
+            response = self._completion()(**kwargs)
+            for chunk in response:
+                content = _extract_stream_text(chunk)
+                if content:
+                    emitted_chars += len(content)
+                    yield content
+                chunk_usage = extract_usage(chunk)
+                if (
+                    chunk_usage.prompt_tokens
+                    or chunk_usage.completion_tokens
+                    or chunk_usage.total_tokens
+                ):
+                    usage = chunk_usage
+        except LLMError:
+            raise
+        except Exception as exc:
+            raise LLMError(f"LLM 流式调用失败: {exc}") from exc
+        finally:
+            if self.ledger is not None and usage is not None:
+                self.ledger.record(usage)
+        if emitted_chars == 0:
+            raise LLMError("LLM 返回内容为空")
 
 
 def build_llm(

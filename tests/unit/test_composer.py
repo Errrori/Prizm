@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import pandas as pd
 import pytest
@@ -119,3 +119,53 @@ def test_composer_falls_back_on_empty_llm_text() -> None:
 
     assert conclusion.source == "template"
     assert conclusion.fallback_reason == "LLM 未返回结论"
+
+
+class StreamingLLM:
+    def __init__(self, chunks: list[str], error: Exception | None = None) -> None:
+        self.chunks = chunks
+        self.error = error
+        self.calls: list[list[Message]] = []
+
+    def complete(self, messages: Sequence[Message], *, temperature: float = 0.0) -> Completion:
+        raise AssertionError("启用流式时不应回退到 complete")
+
+    def stream(
+        self, messages: Sequence[Message], *, temperature: float = 0.0
+    ) -> Iterator[str]:
+        self.calls.append([dict(message) for message in messages])
+        yield from self.chunks
+        if self.error is not None:
+            raise self.error
+
+
+def test_composer_streams_tokens_when_callback_provided() -> None:
+    llm = StreamingLLM(["销售额", "合计 300。"])
+    composer = ConclusionComposer(llm)
+    frame = pd.DataFrame({"total": [300]})
+    tokens: list[str] = []
+
+    conclusion = composer.compose(
+        "已完成销售额", "SELECT 1", frame, on_token=tokens.append
+    )
+
+    assert conclusion.text == "销售额合计 300。"
+    assert conclusion.source == "llm"
+    assert tokens == ["销售额", "合计 300。"]
+    assert llm.calls
+
+
+def test_composer_stream_falls_back_after_error() -> None:
+    llm = StreamingLLM(["部分"], error=LLMError("中断"))
+    composer = ConclusionComposer(llm)
+    frame = pd.DataFrame({"total": [300]})
+    tokens: list[str] = []
+
+    conclusion = composer.compose(
+        "已完成销售额", "SELECT 1", frame, on_token=tokens.append
+    )
+
+    assert conclusion.source == "template"
+    assert conclusion.text == "total = 300。"
+    assert conclusion.fallback_reason == "中断"
+    assert tokens == ["部分"]

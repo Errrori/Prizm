@@ -200,13 +200,13 @@
 - 还清记录：—
 
 ### DEBT-020 透明面板步骤为执行后一次性渲染
-- 状态：未还
+- 状态：已还清
 - 现状：`Orchestrator.ask/resolve` 先同步跑完整轮分析，`app/main.py` 再按 `Trace` 渲染嵌套 Step 与侧栏面板；模型调用期间没有 token 级或步骤级实时反馈。
 - 为什么简化：当前默认 mock 且整轮同步执行，先保证 trace 可测试、面板内容完整，避免在 UI 层引入流式状态机。
 - 触发条件：接入真实模型进行联调/演示前，或用户反馈等待期缺少过程反馈时。
-- 涉及文件：app/main.py, src/prizm/agent/orchestrator.py
+- 涉及文件：app/main.py, src/prizm/agent/orchestrator.py, src/prizm/agent/composer.py, src/prizm/llm/adapter.py
 - 登记日期：2026-11-23
-- 还清记录：—
+- 还清记录：2026-11-24 任务 11-1：`Orchestrator.ask/resolve` 新增可选 `progress` 回调，逐步发 `step` 事件、结论逐块发 `conclusion_token`；`LLMAdapter` 增可选 `stream`（Mock 切片 / litellm `include_usage`），`ConclusionComposer` 支持 `on_token` 并在失败时回退模板；`app/main.py` 用 `asyncio.to_thread` 跑同步编排、`asyncio.Queue` 桥接实时渲染 Step 与结论 token，结束后按权威文本校正。未传回调时行为不变。commit 见本任务 git log。
 
 ### DEBT-021 Excel/SQLite 数据源仅支持单表整表读取
 - 状态：未还

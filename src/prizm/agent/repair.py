@@ -91,6 +91,24 @@ def _emit_end(
         )
 
 
+def _hint_for_error(error: str) -> str | None:
+    lowered = error.lower()
+    if "date_part" in lowered or (
+        "no function matches" in lowered and "varchar" in lowered
+    ):
+        return (
+            "提示：月份/日期列可能是 VARCHAR，请用 substr(列, 1, 7) AS month，"
+            "或先 CAST(列 AS TIMESTAMP)。"
+        )
+    if "from clause is missing" in lowered or "not found in from clause" in lowered:
+        return "提示：聚合和列引用必须带 FROM 表名；CTE 外层只能引用 CTE 已选出的列。"
+    if "must appear in the group by clause" in lowered:
+        return "提示：SELECT 中的非聚合列必须出现在 GROUP BY，或改用聚合表达式。"
+    if "syntax error" in lowered or "parser error" in lowered:
+        return "提示：WITH ... AS (...) 之后必须还有最终 SELECT，并检查括号是否配对。"
+    return None
+
+
 def build_repair_feedback(*, attempt: int, failed_sql: str | None, error: str) -> str:
     parts = [f"第 {attempt} 次尝试失败。", f"错误：{error}"]
     if failed_sql:
@@ -98,6 +116,9 @@ def build_repair_feedback(*, attempt: int, failed_sql: str | None, error: str) -
         if len(sql) > _MAX_SQL_CHARS:
             sql = sql[:_MAX_SQL_CHARS] + "…"
         parts.append(f"失败的 SQL：\n{sql}")
+    hint = _hint_for_error(error)
+    if hint:
+        parts.append(hint)
     parts.append("请修正上述问题，重新输出一个完整 JSON 计划，不要重复同样的错误。")
     return "\n".join(parts)
 

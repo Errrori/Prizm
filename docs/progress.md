@@ -10,7 +10,7 @@
 ---
 
 ## 当前阶段
-MVP、150 题评测集、流式反馈与真实模型复跑已完成；剩余自修复成功率提优
+MVP、150 题评测集、流式反馈、真实模型全量复跑与答案一致性提优均已完成；剩余需求 §4 用户 Key 输入待补
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -25,31 +25,30 @@ MVP、150 题评测集、流式反馈与真实模型复跑已完成；剩余自�
 - 任务 6-1：P2 透明面板：Trace/TraceStep/ProfileReference、Chainlit 嵌套 Step + 侧栏面板
 - 任务 7-1：Excel(.xlsx) / SQLite connector + 上传端多 sheet/多表选择
 - 任务 8-1：结构化 chart spec + matplotlib PNG + LLM 结论（模板兜底）
-- 任务 9-1：真实模型评测 70% 一次成功 / 90% 自修复后；SQLite 额度台账；litellm 不读 .env；README + Dockerfile（非 root/只读/CJK 字体）
-- 任务 10-1：评测集扩至 150 题（orders 55 / monthly 48 / traffic 47，含脏数据变体），多轮会话串接，异常检出率指标接通
-- 任务 11-1：流式过程反馈——LLM 适配器流式、结论逐 token 回调、编排步骤开始/结束双事件、`app/streaming.py` 线程+异步队列实时渲染，含 UI 桥接异步单测，还清 DEBT-020
-- 任务 11-2：真实模型（glm-4-flashx-250414）复跑 150 题——一次 83.3%（125/150，达标≥75%）、自修复后 86.0%（129/150，未达≥90%）、异常检出 100%（12/12）、澄清触发 100%（150/150）；2 题 3 次仍失败，19 题答案不一致
+- 任务 9-1：真实模型评测 70% 一次成功 / 90% 自修复后；SQLite 额度台账；README + Dockerfile
+- 任务 10-1：评测集扩至 150 题，多轮会话串接，异常检出率指标接通
+- 任务 11-1/11-2：流式过程反馈；真实模型 150 题复跑（一次 83.3%、自修复后 86.0%）
+- 任务 12-1：失败归因与答案一致性提优——新增 `--ids/--diagnostics`；planner 约束月份 YYYY-MM、差值方向 A-B、单行单列、COUNT(*)、CTE 最终 SELECT；repair 按错误类型加提示；全量 150 题一次 98.0%（147/150）、自修复后 99.3%（149/150）、异常 100%、澄清 100%；修正 tra-043 标准答案 1744→949
 
 ## 进行中
 - 无
 
 ## 下一步
-- 提升自修复后总成功率至 ≥90%（当前 86%）
+- 补需求 §4 用户自带 Key 会话输入（DEBT-027）
 
 ## 阻塞与风险
-- 非阻塞：自修复后总成功率 86% 未达 90% 目标；19 题答案不一致含 DEBT-013 比对启发式因素
-- 非阻塞：DEBT-023 LLM 结论未纳入评测，失败静默回退模板
-- 非阻塞：DEBT-022 图表 50 点上限、无多序列；字体已在 Docker 内置
-- 非阻塞：DEBT-021 Excel/SQLite 仅单表
-- 非阻塞：DEBT-019 RAG 评测集为模板生成；DEBT-016 路由启发式；DEBT-017 问答未用 LLM 归纳；DEBT-018 50 条 QA 评测待建
-- 非阻塞：DEBT-015 多轮记忆未缓存可查询结果
-- 非阻塞：DEBT-013 评测答案比对为启发式；DEBT-012 只读校验非完整 AST
-- 非阻塞：DEBT-009/010/011 澄清启发式与 LLM 判定回退；DEBT-007/008 主键与脏数值启发式
-- 非阻塞：DEBT-003 CSV 编码回退；DEBT-006 费用依赖 provider 字段
+- 非阻塞：ord-021 偶发差值只返回单边值（1/150，DEBT-026）
+- 非阻塞：DEBT-027 用户自带 Key 会话输入未实现
+- 非阻塞：DEBT-023 LLM 结论未纳入评测；DEBT-022 图表 50 点上限、无多序列
+- 非阻塞：DEBT-021 Excel/SQLite 仅单表；DEBT-019 RAG 模板问法；DEBT-016/017 路由与问答简化
+- 非阻塞：DEBT-015 多轮未缓存可查询结果；DEBT-013 比对仍为启发式（本轮未发现误判）
+- 非阻塞：DEBT-012 只读校验非完整 AST；DEBT-009/010/011 澄清启发式与回退
+- 非阻塞：DEBT-007/008 主键与脏数值启发式；DEBT-003 CSV 编码回退；DEBT-006 费用依赖 provider 字段
 
 ## 关键入口
 - 需求：docs/requirements.md ｜ 架构：docs/architecture.md
 - 技术债：docs/debts.md ｜ 待办：docs/backlog.md
-- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 332 项）｜ 启动：`uv run chainlit run app/main.py`
+- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 346 项）｜ 启动：`uv run chainlit run app/main.py`
 - 容器：`docker build -t prizm .` 后 `docker run --rm -p 8000:8000 --env-file .env -v prizm-data:/data prizm`
 - 评测：`uv run python -m eval.build_tasks`、`-m eval.run_eval --execute`、`-m eval.run_clarify`、`-m eval.run_rag`
+- 失败归因：`python -m eval.run_eval --execute --ids "id1,id2" --diagnostics eval/outcomes/diag.jsonl`

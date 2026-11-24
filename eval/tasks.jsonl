@@ -147,4 +147,4 @@
 {"id": "tra-040", "category": "multi_turn", "dataset": "channel_traffic.csv", "question": "哪个渠道的 visitors 最多？只返回渠道名称。", "expected": "搜索", "expects_clarification": false, "session": "traffic-top-channel"}
 {"id": "tra-041", "category": "multi_turn", "dataset": "channel_traffic.csv", "question": "该渠道的 revenue 总和是多少？", "expected": 91800, "expects_clarification": false, "session": "traffic-top-channel"}
 {"id": "tra-042", "category": "multi_turn", "dataset": "channel_traffic.csv", "question": "按渠道统计 cost，并从高到低排序。", "expected": [{"channel": "搜索", "cost": 30600}, {"channel": "直邮", "cost": 18360}, {"channel": "社交", "cost": 12240}], "expects_clarification": false, "session": "traffic-channel-cost"}
-{"id": "tra-043", "category": "multi_turn", "dataset": "channel_traffic.csv", "question": "只看 cost 最高的两个渠道，再统计它们的 conversions 总量。", "expected": 1744, "expects_clarification": false, "session": "traffic-channel-cost"}
+{"id": "tra-043", "category": "multi_turn", "dataset": "channel_traffic.csv", "question": "只看 cost 最高的两个渠道，再统计它们的 conversions 总量。", "expected": 949, "expects_clarification": false, "session": "traffic-channel-cost"}

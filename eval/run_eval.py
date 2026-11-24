@@ -18,7 +18,7 @@ import math
 import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from numbers import Real
 from pathlib import Path
@@ -36,7 +36,7 @@ from eval.metrics import (
     summarize,
 )
 
-from prizm.agent.orchestrator import Clarification, Orchestrator
+from prizm.agent.orchestrator import Answer, Clarification, Orchestrator
 from prizm.agent.planner import Planner
 from prizm.agent.repair import (
     MAX_REPAIR_ATTEMPTS,
@@ -66,6 +66,25 @@ METRIC_LABELS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class TaskDiagnostic:
+    """逐题诊断快照：期望值、实际 SQL 与结果摘要，仅用于本地失败归因。"""
+
+    task_id: str
+    category: str
+    dataset: str
+    question: str
+    expected: Any
+    result_kind: str
+    sql: str | None
+    columns: list[str]
+    rows: list[dict[str, Any]]
+    attempts: int
+    error: str
+    matched: bool | None
+    session: str | None = None
+
+
 def load_tasks(path: Path) -> list[EvalTask]:
     tasks: list[EvalTask] = []
     seen: set[str] = set()
@@ -87,6 +106,29 @@ def load_tasks(path: Path) -> list[EvalTask]:
         raise ValueError(f"{path}: 没有评测任务")
     _validate_sessions(tasks, path)
     return tasks
+
+
+def select_tasks(tasks: Sequence[EvalTask], ids: str | Sequence[str]) -> list[EvalTask]:
+    """按 id 选中任务；同 session 的任务整体带上，保证多轮上下文可复现。"""
+    requested = (
+        [item.strip() for item in ids.split(",")]
+        if isinstance(ids, str)
+        else [item.strip() for item in ids]
+    )
+    requested = [item for item in requested if item]
+    if not requested:
+        raise ValueError("--ids 不能为空")
+    by_id = {task.id: task for task in tasks}
+    unknown = [item for item in requested if item not in by_id]
+    if unknown:
+        raise ValueError(f"未知任务 id: {', '.join(unknown)}")
+    wanted = set(requested)
+    sessions = {by_id[item].session for item in requested if by_id[item].session}
+    return [
+        task
+        for task in tasks
+        if task.id in wanted or (task.session is not None and task.session in sessions)
+    ]
 
 
 def _validate_sessions(tasks: Sequence[EvalTask], path: Path) -> None:
@@ -241,6 +283,45 @@ def write_outcomes(path: Path, outcomes: Sequence[TaskOutcome]) -> None:
             file.write(json.dumps(asdict(outcome), ensure_ascii=False) + "\n")
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (list, tuple, dict)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except (TypeError, ValueError):
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _rows_for_diagnostics(
+    frame: pd.DataFrame, *, limit: int = 20
+) -> list[dict[str, Any]]:
+    return [
+        {str(key): _jsonable(value) for key, value in row.items()}
+        for row in frame.head(limit).to_dict(orient="records")
+    ]
+
+
+def write_diagnostics(path: Path, diagnostics: Sequence[TaskDiagnostic]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as file:
+        for diagnostic in diagnostics:
+            file.write(json.dumps(asdict(diagnostic), ensure_ascii=False) + "\n")
+
+
 _EXECUTION_ERRORS = (
     LLMError,
     RepairFailed,
@@ -283,14 +364,92 @@ def _error_outcome(task: EvalTask, exc: Exception) -> TaskOutcome:
     )
 
 
-def _run_turn(orchestrator: Orchestrator, task: EvalTask) -> TaskOutcome:
+def _emit_diagnostic(
+    sink: Callable[[TaskDiagnostic], None] | None,
+    diagnostic: TaskDiagnostic,
+) -> None:
+    if sink is not None:
+        sink(diagnostic)
+
+
+def _answer_diagnostic(
+    task: EvalTask,
+    result: Answer,
+    *,
+    matched: bool,
+    error: str,
+) -> TaskDiagnostic:
+    return TaskDiagnostic(
+        task_id=task.id,
+        category=task.category,
+        dataset=task.dataset,
+        question=task.question,
+        expected=task.expected,
+        result_kind="answer",
+        sql=result.sql,
+        columns=[str(column) for column in result.dataframe.columns],
+        rows=_rows_for_diagnostics(result.dataframe),
+        attempts=result.attempts,
+        error=error,
+        matched=matched,
+        session=task.session,
+    )
+
+
+def _error_diagnostic(task: EvalTask, exc: Exception) -> TaskDiagnostic:
+    sql = None
+    if isinstance(exc, RepairFailed) and exc.history:
+        sql = exc.history[-1].sql
+    return TaskDiagnostic(
+        task_id=task.id,
+        category=task.category,
+        dataset=task.dataset,
+        question=task.question,
+        expected=task.expected,
+        result_kind="error",
+        sql=sql,
+        columns=[],
+        rows=[],
+        attempts=exc.attempts if isinstance(exc, RepairFailed) else 1,
+        error=format_repair_error(exc),
+        matched=False,
+        session=task.session,
+    )
+
+
+def _run_turn(
+    orchestrator: Orchestrator,
+    task: EvalTask,
+    *,
+    on_diagnostic: Callable[[TaskDiagnostic], None] | None = None,
+) -> TaskOutcome:
     try:
         result = orchestrator.ask(task.question)
     except _EXECUTION_ERRORS as exc:
+        _emit_diagnostic(on_diagnostic, _error_diagnostic(task, exc))
         return _error_outcome(task, exc)
 
     if isinstance(result, Clarification):
         passed = task.expects_clarification
+        error = "" if passed else "未预期的澄清"
+        _emit_diagnostic(
+            on_diagnostic,
+            TaskDiagnostic(
+                task_id=task.id,
+                category=task.category,
+                dataset=task.dataset,
+                question=task.question,
+                expected=task.expected,
+                result_kind="clarification",
+                sql=None,
+                columns=[],
+                rows=[],
+                attempts=1,
+                error=error,
+                matched=passed,
+                session=task.session,
+            ),
+        )
         return TaskOutcome(
             task_id=task.id,
             category=task.category,
@@ -299,10 +458,28 @@ def _run_turn(orchestrator: Orchestrator, task: EvalTask) -> TaskOutcome:
             expected_clarification=task.expects_clarification,
             clarification_triggered=True,
             attempts=1,
-            error="" if passed else "未预期的澄清",
+            error=error,
         )
 
     if isinstance(result, DictionaryAnswer):
+        _emit_diagnostic(
+            on_diagnostic,
+            TaskDiagnostic(
+                task_id=task.id,
+                category=task.category,
+                dataset=task.dataset,
+                question=task.question,
+                expected=task.expected,
+                result_kind="dictionary",
+                sql=None,
+                columns=[],
+                rows=[],
+                attempts=1,
+                error="误走数据字典问答",
+                matched=False,
+                session=task.session,
+            ),
+        )
         return TaskOutcome(
             task_id=task.id,
             category=task.category,
@@ -314,6 +491,11 @@ def _run_turn(orchestrator: Orchestrator, task: EvalTask) -> TaskOutcome:
         )
 
     final_ok = matches_expected(result.dataframe, task.expected)
+    error = "" if final_ok else "答案与预期不一致"
+    _emit_diagnostic(
+        on_diagnostic,
+        _answer_diagnostic(task, result, matched=final_ok, error=error),
+    )
     return TaskOutcome(
         task_id=task.id,
         category=task.category,
@@ -322,7 +504,7 @@ def _run_turn(orchestrator: Orchestrator, task: EvalTask) -> TaskOutcome:
         expected_clarification=task.expects_clarification,
         clarification_triggered=False,
         attempts=result.attempts,
-        error="" if final_ok else "答案与预期不一致",
+        error=error,
     )
 
 
@@ -333,6 +515,7 @@ def execute_task(
     *,
     max_attempts: int = MAX_REPAIR_ATTEMPTS,
     engine_factory: Callable[[], DuckDBEngine] = DuckDBEngine,
+    on_diagnostic: Callable[[TaskDiagnostic], None] | None = None,
 ) -> TaskOutcome:
     """执行单个任务；单题失败只记录到 TaskOutcome，不中断整批评测。"""
     try:
@@ -344,8 +527,9 @@ def execute_task(
                 engine,
                 max_attempts=max_attempts,
             )
-            return _run_turn(orchestrator, task)
+            return _run_turn(orchestrator, task, on_diagnostic=on_diagnostic)
     except _EXECUTION_ERRORS as exc:
+        _emit_diagnostic(on_diagnostic, _error_diagnostic(task, exc))
         return _error_outcome(task, exc)
 
 
@@ -357,6 +541,7 @@ def execute_tasks(
     max_attempts: int = MAX_REPAIR_ATTEMPTS,
     engine_factory: Callable[[], DuckDBEngine] = DuckDBEngine,
     on_result: Callable[[TaskOutcome], None] | None = None,
+    on_diagnostic: Callable[[TaskDiagnostic], None] | None = None,
 ) -> list[TaskOutcome]:
     """按文件顺序执行任务；同一 ``session`` 复用编排器以串接多轮上下文。"""
     outcomes: list[TaskOutcome] = []
@@ -370,6 +555,7 @@ def execute_tasks(
                     llm,
                     max_attempts=max_attempts,
                     engine_factory=engine_factory,
+                    on_diagnostic=on_diagnostic,
                 )
             else:
                 entry = sessions.get(task.session)
@@ -386,13 +572,20 @@ def execute_tasks(
                     except _EXECUTION_ERRORS as exc:
                         engine.close()
                         outcome = _error_outcome(task, exc)
+                        _emit_diagnostic(
+                            on_diagnostic, _error_diagnostic(task, exc)
+                        )
                     else:
                         sessions[task.session] = (orchestrator, engine)
-                        outcome = _run_turn(orchestrator, task)
+                        outcome = _run_turn(
+                            orchestrator, task, on_diagnostic=on_diagnostic
+                        )
                         if outcome.clarification_triggered:
                             sessions.pop(task.session)[1].close()
                 else:
-                    outcome = _run_turn(entry[0], task)
+                    outcome = _run_turn(
+                        entry[0], task, on_diagnostic=on_diagnostic
+                    )
                     if outcome.clarification_triggered:
                         sessions.pop(task.session)[1].close()
             outcomes.append(outcome)
@@ -517,6 +710,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-attempts", type=int, default=MAX_REPAIR_ATTEMPTS)
     parser.add_argument("--limit", type=int, default=None, help="仅执行前 N 题")
     parser.add_argument(
+        "--ids",
+        default=None,
+        help="仅执行指定任务 id（逗号分隔）；多轮任务自动带上同 session 的前置任务",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        type=Path,
+        default=None,
+        help="--execute 时把逐题 SQL 与实际结果摘要写入 JSONL",
+    )
+    parser.add_argument(
         "--anomaly-expectations",
         type=Path,
         default=DEFAULT_ANOMALY_EXPECTATIONS,
@@ -529,6 +733,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.limit is not None and (not args.execute or args.limit < 1):
         print("错误: --limit 必须与 --execute 一起使用且 >= 1", file=sys.stderr)
+        return 2
+    if args.ids is not None and not args.execute:
+        print("错误: --ids 必须与 --execute 一起使用", file=sys.stderr)
+        return 2
+    if args.ids is not None and args.limit is not None:
+        print("错误: --ids 与 --limit 不能同时使用", file=sys.stderr)
+        return 2
+    if args.diagnostics is not None and not args.execute:
+        print("错误: --diagnostics 必须与 --execute 一起使用", file=sys.stderr)
         return 2
     if args.execute and not 1 <= args.max_attempts <= MAX_REPAIR_ATTEMPTS:
         print(
@@ -555,7 +768,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     all_tasks = tasks
-    if args.execute and args.limit is not None:
+    if args.execute and args.ids is not None:
+        try:
+            tasks = select_tasks(tasks, args.ids)
+        except ValueError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 2
+        print(f"已选择任务: {len(tasks)}（含同会话前置）")
+    elif args.execute and args.limit is not None:
         tasks = tasks[: args.limit]
 
     print(format_task_summary(tasks))
@@ -585,6 +805,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if outcome.error:
                 print(f"  {outcome.error}", flush=True)
 
+        diagnostics: list[TaskDiagnostic] = []
+
+        def collect(diagnostic: TaskDiagnostic) -> None:
+            diagnostics.append(diagnostic)
+
         def engine_factory() -> DuckDBEngine:
             return DuckDBEngine(
                 memory_limit=settings.duckdb_memory_limit,
@@ -599,13 +824,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_attempts=args.max_attempts,
             engine_factory=engine_factory,
             on_result=report,
+            on_diagnostic=collect if args.diagnostics is not None else None,
         )
         try:
             write_outcomes(args.outcomes, outcomes)
+            if args.diagnostics is not None:
+                write_diagnostics(args.diagnostics, diagnostics)
         except OSError as exc:
             print(f"错误: 写入结果失败: {exc}", file=sys.stderr)
             return 2
         print(f"结果已写入: {args.outcomes}")
+        if args.diagnostics is not None:
+            print(f"诊断已写入: {args.diagnostics}")
 
         metrics = with_anomaly_metric(
             summarize(outcomes), all_tasks, args.datasets_dir, expectations

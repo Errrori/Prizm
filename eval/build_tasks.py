@@ -125,7 +125,8 @@ def build_tasks() -> list[dict[str, Any]]:
     traffic_social = traffic[traffic["channel"] == "社交"]
     traffic_direct = traffic[traffic["channel"] == "直邮"]
     traffic_h2 = traffic[traffic["month"] >= "2025-07"]
-    traffic_top2 = traffic[traffic["channel"].isin(["搜索", "社交"])]
+    traffic_top2_channels = traffic.groupby("channel")["cost"].sum().nlargest(2).index
+    traffic_top2 = traffic[traffic["channel"].isin(traffic_top2_channels)]
 
     tasks: list[dict[str, Any]] = []
 

@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from prizm.agent.planner import (
+    SYSTEM_PROMPT,
     Planner,
     PlanParseError,
     build_mock_plan_response,
@@ -12,6 +13,15 @@ from prizm.agent.planner import (
     parse_plan,
 )
 from prizm.llm.adapter import MockLLM
+
+
+def test_system_prompt_requires_month_format_and_scalar_shapes() -> None:
+    assert "YYYY-MM" in SYSTEM_PROMPT
+    assert "单行单列" in SYSTEM_PROMPT
+    assert "多/少多少" in SYSTEM_PROMPT
+    assert "在此基础上" in SYSTEM_PROMPT
+    assert "COUNT(*)" in SYSTEM_PROMPT
+    assert "最终 SELECT" in SYSTEM_PROMPT
 
 
 def test_schema_summary_lists_columns_and_types() -> None:

@@ -78,8 +78,14 @@ def test_oracle_subset_can_reach_full_success() -> None:
     tasks = load_tasks(REPO_ROOT / DEFAULT_TASKS_PATH)
     subset = [task for task in tasks if task.id in ORACLE_TASK_IDS]
     llm = OracleLLM()
+    diagnostics: list = []
 
-    outcomes = execute_tasks(subset, REPO_ROOT / DEFAULT_DATASETS_DIR, llm)
+    outcomes = execute_tasks(
+        subset,
+        REPO_ROOT / DEFAULT_DATASETS_DIR,
+        llm,
+        on_diagnostic=diagnostics.append,
+    )
 
     assert [outcome.task_id for outcome in outcomes] == [task.id for task in subset]
     assert all(outcome.first_pass_ok for outcome in outcomes)
@@ -87,6 +93,16 @@ def test_oracle_subset_can_reach_full_success() -> None:
     assert all(outcome.error == "" for outcome in outcomes)
     assert llm.calls == 7
     assert any(task.session == "orders-channel-followup" for task in subset)
+    assert [diagnostic.task_id for diagnostic in diagnostics] == [
+        task.id for task in subset
+    ]
+    answer_diagnostics = [
+        diagnostic for diagnostic in diagnostics if diagnostic.result_kind == "answer"
+    ]
+    assert answer_diagnostics
+    assert all(diagnostic.sql for diagnostic in answer_diagnostics)
+    assert all(diagnostic.matched for diagnostic in answer_diagnostics)
+    assert any(diagnostic.rows for diagnostic in answer_diagnostics)
 
     metrics = summarize(outcomes)
     assert metrics["first_pass_success_rate"].value == 1.0

@@ -2,9 +2,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pytest
 from eval.metrics import EvalTask, TaskOutcome, summarize
 from eval.run_eval import (
+    TaskDiagnostic,
+    _rows_for_diagnostics,
     evaluate_anomalies,
     format_metric_table,
     format_task_summary,
@@ -13,7 +16,9 @@ from eval.run_eval import (
     load_tasks,
     main,
     missing_datasets,
+    select_tasks,
     with_anomaly_metric,
+    write_diagnostics,
 )
 
 
@@ -84,6 +89,31 @@ def test_load_tasks_rejects_empty_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="没有评测任务"):
         load_tasks(path)
+
+
+def test_select_tasks_expands_whole_session() -> None:
+    tasks = [
+        make_task("t1", category="multi_turn", session="s1"),
+        make_task("t2", category="multi_turn", session="s1"),
+        make_task("t3"),
+        make_task("t4", category="multi_turn", session="s2"),
+    ]
+
+    selected = select_tasks(tasks, "t2,t4")
+
+    assert [task.id for task in selected] == ["t1", "t2", "t4"]
+
+
+def test_select_tasks_rejects_unknown_id() -> None:
+    tasks = [make_task("t1")]
+
+    with pytest.raises(ValueError, match="未知任务 id: missing"):
+        select_tasks(tasks, "missing")
+
+
+def test_select_tasks_rejects_empty_ids() -> None:
+    with pytest.raises(ValueError, match="--ids 不能为空"):
+        select_tasks([make_task("t1")], " , ")
 
 
 def test_missing_datasets_reports_only_absent_files(tmp_path: Path) -> None:
@@ -233,6 +263,17 @@ def test_repository_tasks_match_independent_builder() -> None:
         )
 
 
+def test_tra_043_expected_uses_top_two_channels_by_cost() -> None:
+    root = Path(__file__).resolve().parents[2]
+    frame = pd.read_csv(root / "eval" / "datasets" / "channel_traffic.csv")
+    top2 = frame.groupby("channel")["cost"].sum().nlargest(2).index
+    expected = int(frame[frame["channel"].isin(top2)]["conversions"].sum())
+    tasks = {task.id: task for task in load_tasks(root / "eval" / "tasks.jsonl")}
+
+    assert expected == 949
+    assert tasks["tra-043"].expected == expected
+
+
 def test_with_anomaly_metric_uses_dataset_profiles() -> None:
     root = Path(__file__).resolve().parents[2]
     tasks = load_tasks(root / "eval" / "tasks.jsonl")
@@ -303,6 +344,55 @@ def test_load_outcomes_rejects_invalid_fields(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="结果字段非法"):
         load_outcomes(path)
+
+
+def test_rows_for_diagnostics_converts_timestamps_and_missing() -> None:
+    frame = pd.DataFrame(
+        {
+            "month": [pd.Timestamp("2026-01-01")],
+            "sales": [float("nan")],
+            "count": [5],
+            "note": [None],
+        }
+    )
+
+    rows = _rows_for_diagnostics(frame)
+
+    assert rows == [
+        {
+            "month": "2026-01-01T00:00:00",
+            "sales": None,
+            "count": 5,
+            "note": None,
+        }
+    ]
+
+
+def test_write_diagnostics_serializes_expected_and_rows(tmp_path: Path) -> None:
+    diagnostic = TaskDiagnostic(
+        task_id="t1",
+        category="trend",
+        dataset="orders.csv",
+        question="按月统计销售额",
+        expected=[{"month": "2026-01", "sales": 100}],
+        result_kind="answer",
+        sql="SELECT month, sales FROM orders",
+        columns=["month", "sales"],
+        rows=[{"month": "2026-01", "sales": 100}],
+        attempts=1,
+        error="",
+        matched=True,
+        session=None,
+    )
+    path = tmp_path / "diagnostics.jsonl"
+
+    write_diagnostics(path, [diagnostic])
+
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["task_id"] == "t1"
+    assert record["expected"] == [{"month": "2026-01", "sales": 100}]
+    assert record["rows"] == [{"month": "2026-01", "sales": 100}]
+    assert record["matched"] is True
 
 
 def test_format_metric_table_shows_pass_fail_and_na() -> None:
@@ -425,6 +515,23 @@ def test_main_with_results_outputs_metrics(
     assert exit_code == 0
     assert "一次执行成功率" in output
     assert "100.0%" in output
+
+
+def test_main_rejects_ids_without_execute(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--ids", "t1"]) == 2
+    assert "--ids 必须与 --execute" in capsys.readouterr().err
+
+
+def test_main_rejects_ids_with_limit(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--execute", "--ids", "t1", "--limit", "1"]) == 2
+    assert "--ids 与 --limit 不能同时使用" in capsys.readouterr().err
+
+
+def test_main_rejects_diagnostics_without_execute(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--diagnostics", "diag.jsonl"]) == 2
+    assert "--diagnostics 必须与 --execute" in capsys.readouterr().err
 
 
 def test_main_returns_one_when_metric_fails(

@@ -227,6 +227,52 @@ def test_build_repair_feedback_includes_error_and_sql() -> None:
     assert "SELECT bad FROM orders" in feedback
 
 
+def test_build_repair_feedback_hints_date_cast_for_varchar() -> None:
+    feedback = build_repair_feedback(
+        attempt=1,
+        failed_sql="SELECT EXTRACT(MONTH FROM order_date) FROM orders",
+        error=(
+            "BinderException: No function matches the given name and argument "
+            "types 'date_part(STRING_LITERAL, VARCHAR)'"
+        ),
+    )
+
+    assert "substr(列, 1, 7)" in feedback
+
+
+def test_build_repair_feedback_hints_group_by() -> None:
+    feedback = build_repair_feedback(
+        attempt=1,
+        failed_sql="SELECT month, sales FROM orders GROUP BY month",
+        error='Binder Error: column "sales" must appear in the GROUP BY clause',
+    )
+
+    assert "非聚合列必须出现在 GROUP BY" in feedback
+
+
+def test_build_repair_feedback_hints_missing_final_select() -> None:
+    feedback = build_repair_feedback(
+        attempt=1,
+        failed_sql="WITH t AS (SELECT 1)",
+        error='SQLValidationError: Parser Error: syntax error at or near ")"',
+    )
+
+    assert "必须还有最终 SELECT" in feedback
+
+
+def test_build_repair_feedback_hints_missing_from_clause() -> None:
+    feedback = build_repair_feedback(
+        attempt=1,
+        failed_sql="WITH t AS (SELECT SUM(revenue)) SELECT 1",
+        error=(
+            'Binder Error: Referenced column "month" was not found because '
+            "the FROM clause is missing"
+        ),
+    )
+
+    assert "必须带 FROM 表名" in feedback
+
+
 def test_repairer_emits_step_start_and_end_events() -> None:
     bad_sql = "SELECT missing_column FROM orders"
     good_sql = "SELECT SUM(sales) AS total FROM orders"

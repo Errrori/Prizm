@@ -15,6 +15,7 @@ import pandas as pd
 from prizm.engine.duckdb_engine import quote_identifier
 from prizm.llm.adapter import LLMAdapter, Message
 
+# DEBT-026: 差值类问题依赖 prompt 约束, 未做确定性 SQL 结构校验。
 SYSTEM_PROMPT = """你是数据分析 SQL 规划器，只输出一个 JSON 对象，不要输出解释或 Markdown。
 JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 或：{"sql": "<DuckDB 只读 SQL>", "chart": {"type": "bar|line|pie|scatter",
@@ -27,7 +28,34 @@ JSON 结构：{"sql": "<DuckDB 只读 SQL>", "chart": null}
 - 若提供了最近对话与结果，结合上一轮问题和 SQL 理解“上一题/再算一次”等指代。
 - 若提供了用户已确认的数据口径，必须严格遵循，不得自行更改。
 - 若提供了上次失败信息，必须针对错误修正 SQL，不要重复同样的错误。
-- 聚合结果请把聚合列别名设为原列名（如 SUM(sales) AS sales），计数列命名为 count；时间分组用 month。
+- 聚合结果请把聚合列别名设为原列名：SUM(sales) AS sales、AVG(sales) AS sales、
+  SUM(revenue) AS revenue；计数列命名为 count；时间分组用 month。
+- 时间列可能是 VARCHAR：按月份分组时不要直接 EXTRACT(... FROM 月份列)；
+  优先用 substr(月份列, 1, 7) AS month 得到 YYYY-MM，或先 CAST(月份列 AS DATE/TIMESTAMP) 再分组。
+  按月份统计必须输出 YYYY-MM 格式的 month 列。
+- 问“订单/记录数量”用 COUNT(*)，不要用 SUM(quantity)；
+  只有明确问“销量/件数/units_sold”时才求和数量列。
+- 比较 DATE/TIMESTAMP 列时不要直接与 'YYYY-MM' 比较；按月统计统一用 substr(..., 1, 7)，
+  需要日期边界时用 'YYYY-MM-01' 或 DATE 'YYYY-MM-DD'。
+- 问“A 比 B 多/少多少”时，只返回单行单列的差值，方向必须是前者减后者（A - B）；
+  例如“12 月比 1 月多多少”= 12 月 - 1 月，不要反过来。
+  （如 SUM(CASE WHEN channel='A' THEN sales END)
+   - SUM(CASE WHEN channel='B' THEN sales END) AS diff），
+  禁止返回按 A/B 分组的明细。
+- 问“总量/合计/总额/总计”时，只返回单行单列的聚合值，禁止保留 GROUP BY 明细。
+- 问“数量/多少”且已限定对象（如“该地区”“刚才那个渠道”）时，只返回该聚合值一列，
+  不要附加对象名称列；问“哪个/哪个月”且只要求名称或月份时，只返回该列。
+- 问“成本/销量等指标最高的前 N 个 X 的某指标总量”时，先用子查询或 CTE 按该指标选出前 N 个 X，
+  再对其求和，最终只返回单行单列。
+- 使用 WITH/子查询时必须写出最终 SELECT，禁止只输出 CTE 定义；
+  所有列引用和聚合函数都必须有对应的 FROM 表。
+- 多轮追问“在此基础上/再看/只保留”时，必须沿用上一轮的筛选条件和聚合口径，
+  再按本轮要求追加过滤或聚合。
+- 示例（按月趋势）：SELECT substr(<时间列>, 1, 7) AS month, SUM(<数值列>) AS <数值列>
+  FROM <表> WHERE <过滤条件> GROUP BY month ORDER BY month
+- 示例（差值）：SELECT SUM(CASE WHEN substr(<时间列>, 1, 7) = '<月份A>' THEN <数值列> ELSE 0 END)
+  - SUM(CASE WHEN substr(<时间列>, 1, 7) = '<月份B>' THEN <数值列> ELSE 0 END) AS diff
+  FROM <表> WHERE <过滤条件>
 - 问“是否存在完全重复的行 / 重复行数”时，必须返回一行计数
   （如 COUNT(*) - COUNT(DISTINCT <所有列>) AS duplicate_rows），
   不能返回 GROUP BY ... HAVING 的空结果。

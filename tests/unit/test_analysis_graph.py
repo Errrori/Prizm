@@ -77,7 +77,7 @@ def test_graph_success_path() -> None:
     assert answer.attempts == 1
     assert answer.repaired is False
     assert answer.sql == "SELECT 1"
-    assert answer.dataframe is frame
+    assert answer.dataframe.equals(frame)
     assert answer.conclusion
     assert answer.trace is not None
     assert answer.trace.execution_status == "succeeded"

@@ -1,92 +1,51 @@
-"""最薄端到端编排：连接器 → 体检 → 澄清门禁 → Planner → 执行 → 结果。"""
+"""对话式编排：数据字典路由 + LangGraph 分析链路（澄清走 interrupt/resume）。
+
+对外 API（``ask`` / ``resolve`` / ``last_trace`` / ``pending_clarification``）保持不变，
+内部把规划、执行、条件重试、图表、结论、记忆全部交给 ``agent.graph``。
+"""
 
 from __future__ import annotations
 
-import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
+from langgraph.types import Command
 
 from prizm.agent.clarify import ClarificationOption, ClarificationRequest, ClarifyGate
-from prizm.agent.composer import Conclusion, ConclusionComposer, template_conclusion
+from prizm.agent.composer import ConclusionComposer
+from prizm.agent.graph import (
+    AnalysisDeps,
+    build_analysis_graph,
+    build_failed_trace,
+    build_trace_from_state,
+    default_checkpointer,
+    initial_state,
+    repair_failed_from_state,
+)
 from prizm.agent.memory import ConversationMemory, Turn
 from prizm.agent.planner import Planner
-from prizm.agent.progress import ProgressEvent, ProgressSink, TokenSink
-from prizm.agent.repair import RepairAttempt, Repairer, RepairFailed
-from prizm.agent.trace import (
-    ProfileReference,
-    Trace,
-    TraceStep,
-    policy_label,
-)
+from prizm.agent.progress import ProgressEvent, ProgressSink
+from prizm.agent.repair import MAX_REPAIR_ATTEMPTS, Repairer
+from prizm.agent.results import Answer, Clarification, format_result_table
+from prizm.agent.trace import Trace, TraceStep
 from prizm.datasource.base import BaseConnector
 from prizm.engine.duckdb_engine import DuckDBEngine
-from prizm.profiling.models import Anomaly, ProfileReport
+from prizm.profiling.models import ProfileReport
 from prizm.profiling.profiler import ProfileOptions, profile_frame
 from prizm.rag.retriever import DictionaryAnswer, DictionaryQA, is_dictionary_question
 
-if TYPE_CHECKING:
-    from prizm.viz.charts import ChartSpec
-
-_HISTORY_PREVIEW_ROWS = 3
-
 
 @dataclass(frozen=True, slots=True)
-class Answer:
-    question: str
-    sql: str
-    dataframe: pd.DataFrame
-    chart: dict[str, Any] | None = None
-    chart_png: bytes | None = None
-    conclusion: str = ""
-    conclusion_source: str = "template"
-    attempts: int = 1
-    repair_history: tuple[RepairAttempt, ...] = ()
-    trace: Trace | None = None
-
-    @property
-    def empty(self) -> bool:
-        return bool(self.dataframe.empty)
-
-    @property
-    def repaired(self) -> bool:
-        return self.attempts > 1
-
-
-@dataclass(frozen=True, slots=True)
-class Clarification:
+class _Pending:
     question: str
     request: ClarificationRequest
-    remaining: int = 0
-    trace: Trace | None = None
-
-
-@dataclass
-class _PendingClarification:
-    question: str
-    requests: tuple[ClarificationRequest, ...]
-    index: int = 0
-
-    @property
-    def current(self) -> ClarificationRequest:
-        return self.requests[self.index]
-
-    @property
-    def remaining_after(self) -> int:
-        return len(self.requests) - self.index - 1
-
-    @property
-    def done(self) -> bool:
-        return self.index >= len(self.requests)
-
-    def advance(self) -> None:
-        self.index += 1
+    remaining: int
 
 
 class Orchestrator:
-    """单数据集、多轮问答；上传后立即体检，提问时先过澄清门禁。"""
+    """单数据集、多轮问答；上传后立即体检，分析链路由图编排。"""
 
     def __init__(
         self,
@@ -105,7 +64,6 @@ class Orchestrator:
         self._frame = connector.load()
         self._engine = engine
         self._planner = planner
-        self._repairer = repairer or Repairer(planner, engine)
         self._memory = memory or ConversationMemory()
         self._dictionary_qa = dictionary_qa
         self._conclusion_composer = conclusion_composer
@@ -118,8 +76,29 @@ class Orchestrator:
         connector.register(engine)
         self.view_name = connector.view_name
         self._clarify_gate = clarify_gate or ClarifyGate()
-        self._pending: _PendingClarification | None = None
+        self._pending: _Pending | None = None
         self._last_trace: Trace | None = None
+        self._thread_id: str | None = None
+        self._turn_seq = 0
+        self._instance_id = uuid.uuid4().hex
+
+        max_attempts = repairer.max_attempts if repairer is not None else MAX_REPAIR_ATTEMPTS
+        self._deps = AnalysisDeps(
+            planner=planner,
+            engine=engine,
+            frame=self._frame,
+            view_name=self.view_name,
+            profile_summary=self._profile.to_prompt(
+                max_chars=self._profile_options.max_prompt_chars
+            ),
+            composer=conclusion_composer,
+            clarify_gate=self._clarify_gate,
+            profile=self._profile,
+            memory=self._memory,
+            max_attempts=max_attempts,
+        )
+        self._checkpointer = default_checkpointer()
+        self._graph = build_analysis_graph(self._deps, checkpointer=self._checkpointer)
 
     @property
     def dataframe(self) -> pd.DataFrame:
@@ -146,7 +125,12 @@ class Orchestrator:
     def pending_clarification(self) -> Clarification | None:
         if self._pending is None:
             return None
-        return self._as_clarification(self._pending, self._last_trace)
+        return Clarification(
+            question=self._pending.question,
+            request=self._pending.request,
+            remaining=self._pending.remaining,
+            trace=self._last_trace,
+        )
 
     def ask(
         self,
@@ -171,10 +155,19 @@ class Orchestrator:
                 ),
             )
             self._last_trace = Trace(question=text, steps=steps)
-            for step in steps:
-                _emit_step(progress, step)
+            if progress is not None:
+                for step in steps:
+                    progress(
+                        ProgressEvent(
+                            kind="step",
+                            name=step.name,
+                            status=step.status,
+                            summary=step.summary,
+                            detail=step.detail,
+                        )
+                    )
             return answer
-        return self._advance(text, progress=progress)
+        return self._run(text, progress)
 
     def resolve(
         self,
@@ -182,393 +175,81 @@ class Orchestrator:
         *,
         progress: ProgressSink | None = None,
     ) -> Answer | Clarification:
-        """记录用户对当前澄清项的回复；全部澄清完成后重跑原问题。"""
+        """记录用户对当前澄清项的回复；全部澄清完成后恢复图并执行。"""
         pending = self._pending
         if pending is None:
             raise RuntimeError("当前没有待澄清的问题")
-        option = _match_option(pending.current, value)
-        self._clarify_gate.confirm(
-            pending.current.code,
-            option.label,
-            question=pending.question,
-        )
-        policy_name = policy_label(pending.current.code)
-        step = TraceStep(
-            "按确认口径处理",
-            "ok",
-            f"{policy_name}：{option.label}",
-            detail=option.description or None,
-        )
-        prior_steps: list[TraceStep] = []
-        prior_references: tuple[ProfileReference, ...] = ()
-        if self._last_trace is not None and self._last_trace.question == pending.question:
-            prior_steps = list(self._last_trace.steps)
-            prior_references = self._last_trace.profile_references
-        steps = list(prior_steps)
-        _append_step(steps, step)
-        _emit_step(progress, step)
-        pending.advance()
-        references = _merge_references(
-            prior_references,
-            _profile_references(self._profile, pending.requests),
-        )
-        if not pending.done:
-            trace = self._clarification_trace(pending, steps, references)
-            self._last_trace = trace
-            return self._as_clarification(pending, trace)
-        self._pending = None
-        return self._advance(pending.question, steps, references, progress=progress)
+        if self._thread_id is None:
+            raise RuntimeError("当前没有待澄清的问题")
+        option = _match_option(pending.request, value)
+        config = {"configurable": {"thread_id": self._thread_id}}
+        snapshot = self._invoke(Command(resume=option.value), config, progress)
+        return self._handle(snapshot, pending.question)
 
-    def _advance(
+    def _run(
         self,
         question: str,
-        prior_steps: Sequence[TraceStep] = (),
-        prior_references: Sequence[ProfileReference] = (),
-        *,
-        progress: ProgressSink | None = None,
+        progress: ProgressSink | None,
     ) -> Answer | Clarification:
-        decision = self._clarify_gate.judge(question, self._profile)
-        steps = list(prior_steps)
-        references = _merge_references(
-            tuple(prior_references),
-            _profile_references(self._profile, decision.requests),
-        )
-        if decision.needs_clarification:
-            reasons = "；".join(request.reason for request in decision.requests)
-            step = TraceStep(
-                "体检与澄清判定",
-                "clarify",
-                f"触发 {len(decision.requests)} 项澄清，暂不执行",
-                detail=reasons,
-            )
-            _append_step(steps, step)
-            _emit_step(progress, step)
-            self._pending = _PendingClarification(question, decision.requests)
-            trace = self._clarification_trace(self._pending, steps, references)
-            self._last_trace = trace
-            return self._as_clarification(self._pending, trace)
-        step = TraceStep(
-            "体检与澄清判定",
-            "ok",
-            f"体检 {len(self._profile.anomalies)} 条异常，无新增待澄清项，进入规划",
-        )
-        _append_step(steps, step)
-        _emit_step(progress, step)
-        return self._execute(question, steps, references, progress=progress)
+        self._turn_seq += 1
+        self._thread_id = f"{self._instance_id}:{self._turn_seq}"
+        config = {"configurable": {"thread_id": self._thread_id}}
+        snapshot = self._invoke(initial_state(question), config, progress)
+        return self._handle(snapshot, question)
 
-    def _execute(
+    def _invoke(
         self,
-        question: str,
-        prior_steps: Sequence[TraceStep] = (),
-        references: Sequence[ProfileReference] = (),
-        *,
-        progress: ProgressSink | None = None,
-    ) -> Answer:
-        policies = self._clarify_gate.policy_summary()
-        steps = list(prior_steps)
-        start = time.perf_counter()
+        payload: object,
+        config: dict,
+        progress: ProgressSink | None,
+    ):
+        """有进度回调时走 LangGraph custom stream，否则直接 invoke。"""
+        self._deps.progress = None
+        self._deps.streaming = progress is not None
         try:
-            outcome = self._repairer.run(
-                question,
-                self.view_name,
-                self._frame,
-                profile_summary=self._profile.to_prompt(
-                    max_chars=self._profile_options.max_prompt_chars
-                ),
-                confirmed_policies=policies or None,
-                conversation_summary=self._memory.format_for_prompt(),
-                progress=progress,
-            )
-        except RepairFailed as exc:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            failed_sql = exc.history[-1].sql if exc.history else None
-            _append_step(
-                steps,
-                TraceStep(
-                    "SQL 规划与执行",
-                    "failed",
-                    f"已尝试 {exc.attempts} 次仍未成功",
-                    detail=_format_repair_history(exc.history) or exc.last_error,
-                ),
-            )
-            self._last_trace = Trace(
-                question=question,
-                steps=tuple(steps),
-                generated_sql=failed_sql,
-                execution_status="failed",
-                profile_references=tuple(references),
-                confirmed_policies=tuple(policies.items()),
-                attempts=exc.attempts,
-                elapsed_ms=elapsed_ms,
-            )
-            raise
-
-        _append_step(
-            steps,
-            TraceStep("SQL 规划", "ok", "已生成只读 SQL", detail=outcome.plan.sql),
-        )
-        if outcome.attempts > 1:
-            repaired_step = TraceStep(
-                "自修复",
-                "repaired",
-                f"第 {outcome.attempts} 次尝试成功",
-                detail=_format_repair_history(outcome.history) or None,
-            )
-            _append_step(steps, repaired_step)
-            _emit_step(progress, repaired_step)
-        dataframe = outcome.dataframe
-        _append_step(
-            steps,
-            TraceStep(
-                "执行",
-                "ok",
-                f"返回 {len(dataframe)} 行 × {len(dataframe.columns)} 列",
-            ),
-        )
-
-        chart_spec, chart_payload, chart_png, chart_step = _render_plan_chart(
-            outcome.plan.chart, dataframe
-        )
-        if chart_step is not None:
-            _append_step(steps, chart_step)
-            _emit_step(progress, chart_step)
-
-        if self._conclusion_composer is None:
-            conclusion = Conclusion(template_conclusion(dataframe))
-            conclusion_step = TraceStep(
-                "结论生成", "ok", "使用模板结论（未启用模型归纳）"
-            )
-            _append_step(steps, conclusion_step)
-            _emit_step(progress, conclusion_step)
-        else:
-            _start_step(progress, "结论生成", "正在归纳结论…")
-            token_callback: TokenSink | None = None
-            if progress is not None:
-
-                def _emit_token(chunk: str) -> None:
-                    progress(ProgressEvent(kind="conclusion_token", text=chunk))
-
-                token_callback = _emit_token
-
-            conclusion = self._conclusion_composer.compose(
-                question,
-                outcome.plan.sql,
-                dataframe,
-                chart=chart_spec,
-                on_token=token_callback,
-            )
-            if conclusion.source == "llm":
-                conclusion_step = TraceStep(
-                    "结论生成",
-                    "ok",
-                    "已用模型归纳结果",
-                    detail=conclusion.text,
-                )
+            if progress is None:
+                self._graph.invoke(payload, config)
             else:
-                conclusion_step = TraceStep(
-                    "结论生成",
-                    "fallback",
-                    "模型结论不可用，已回退模板",
-                    detail=conclusion.fallback_reason,
-                )
-            _append_step(steps, conclusion_step)
-            _emit_step(progress, conclusion_step)
+                for chunk in self._graph.stream(payload, config, stream_mode="custom"):
+                    if isinstance(chunk, ProgressEvent):
+                        progress(chunk)
+        finally:
+            self._deps.streaming = False
+        return self._graph.get_state(config)
 
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        trace = Trace(
-            question=question,
-            steps=tuple(steps),
-            generated_sql=outcome.plan.sql,
-            execution_status="repaired" if outcome.attempts > 1 else "succeeded",
-            profile_references=tuple(references),
-            confirmed_policies=tuple(policies.items()),
-            attempts=outcome.attempts,
-            elapsed_ms=elapsed_ms,
-        )
-        self._last_trace = trace
-
-        answer = Answer(
-            question=question,
-            sql=outcome.plan.sql,
-            dataframe=dataframe,
-            chart=chart_payload,
-            chart_png=chart_png,
-            conclusion=conclusion.text,
-            conclusion_source=conclusion.source,
-            attempts=outcome.attempts,
-            repair_history=outcome.history,
-            trace=trace,
-        )
-        self._memory.add(
-            Turn(
-                question=question,
-                sql=answer.sql,
-                columns=tuple(str(column) for column in answer.dataframe.columns),
-                row_count=len(answer.dataframe),
-                preview=tuple(
-                    {str(key): value for key, value in row.items()}
-                    for row in answer.dataframe.head(_HISTORY_PREVIEW_ROWS).to_dict(
-                        orient="records"
-                    )
-                ),
-                chart=answer.chart,
-            )
-        )
-        return answer
-
-    def _clarification_trace(
+    def _handle(
         self,
-        pending: _PendingClarification,
-        steps: Sequence[TraceStep],
-        references: Sequence[ProfileReference] = (),
-    ) -> Trace:
-        return Trace(
-            question=pending.question,
-            steps=tuple(steps),
-            execution_status="not_run",
-            profile_references=tuple(references),
-            confirmed_policies=tuple(self._clarify_gate.policy_summary().items()),
-        )
-
-    @staticmethod
-    def _as_clarification(
-        pending: _PendingClarification,
-        trace: Trace | None = None,
-    ) -> Clarification:
-        return Clarification(
-            question=pending.question,
-            request=pending.current,
-            remaining=pending.remaining_after,
-            trace=trace,
-        )
-
-
-def _render_plan_chart(
-    raw: dict[str, Any] | None,
-    dataframe: pd.DataFrame,
-) -> tuple[ChartSpec | None, dict[str, Any] | None, bytes | None, TraceStep | None]:
-    """校验并渲染图表；图表属于展示层，失败不阻断分析。"""
-    if raw is None:
-        return None, None, None, None
-
-    from prizm.viz.charts import (
-        MAX_CHART_POINTS,
-        ChartError,
-        parse_chart_spec,
-        render_chart,
-    )
-
-    try:
-        spec = parse_chart_spec(raw, dataframe.columns)
-        if spec is None:
-            return None, None, None, None
-        png = render_chart(spec, dataframe)
-    except ChartError as exc:
-        return (
-            None,
-            None,
-            None,
-            TraceStep(
-                "图表",
-                "skipped",
-                "图表参数不可用，已改用表格展示",
-                detail=str(exc),
-            ),
-        )
-
-    detail = spec.title
-    if len(dataframe) > MAX_CHART_POINTS:
-        note = f"仅展示前 {MAX_CHART_POINTS} 个数据点"
-        detail = f"{spec.title}（{note}）" if spec.title else note
-    return (
-        spec,
-        spec.as_dict(),
-        png,
-        TraceStep(
-            "图表",
-            "ok",
-            f"已渲染 {spec.type} 图：{spec.x} → {spec.y}",
-            detail=detail,
-        ),
-    )
-
-
-def _profile_references(
-    profile: ProfileReport,
-    requests: Sequence[ClarificationRequest],
-) -> tuple[ProfileReference, ...]:
-    references: list[ProfileReference] = []
-    for request in requests:
-        matched = [
-            anomaly
-            for anomaly in profile.anomalies
-            if _request_matches_anomaly(request, anomaly)
-        ]
-        if not matched:
-            continue
-        references.append(
-            ProfileReference(
-                code=request.code,
-                column=request.column,
-                count=sum(anomaly.count for anomaly in matched),
-                reason=request.reason,
+        snapshot: object,
+        question: str,
+    ) -> Answer | Clarification:
+        state = snapshot.values
+        interrupts = getattr(snapshot, "interrupts", ()) or ()
+        if interrupts:
+            payload = interrupts[0].value
+            request = payload["request"]
+            remaining = int(payload.get("remaining", 0))
+            self._pending = _Pending(question, request, remaining)
+            trace = build_trace_from_state(
+                self._deps, state, status="not_run", question=question
             )
-        )
-    return tuple(references)
+            self._last_trace = trace
+            return Clarification(
+                question=question,
+                request=request,
+                remaining=remaining,
+                trace=trace,
+            )
 
+        self._pending = None
+        if state.get("failed"):
+            self._last_trace = build_failed_trace(self._deps, state, question=question)
+            raise repair_failed_from_state(question, state)
 
-def _request_matches_anomaly(request: ClarificationRequest, anomaly: Anomaly) -> bool:
-    if request.code != anomaly.code:
-        return False
-    if not request.column or not anomaly.column:
-        return True
-    columns = {part.strip() for part in request.column.split("/") if part.strip()}
-    return anomaly.column in columns
-
-
-def _merge_references(
-    *groups: Sequence[ProfileReference],
-) -> tuple[ProfileReference, ...]:
-    merged: list[ProfileReference] = []
-    seen: set[tuple[str, str | None, str]] = set()
-    for group in groups:
-        for reference in group:
-            key = (reference.code, reference.column, reference.reason)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(reference)
-    return tuple(merged)
-
-
-def _start_step(progress: ProgressSink | None, name: str, summary: str) -> None:
-    if progress is None:
-        return
-    progress(ProgressEvent(kind="step_start", name=name, summary=summary))
-
-
-def _emit_step(progress: ProgressSink | None, step: TraceStep) -> None:
-    if progress is None:
-        return
-    progress(
-        ProgressEvent(
-            kind="step",
-            name=step.name,
-            status=step.status,
-            summary=step.summary,
-            detail=step.detail,
-        )
-    )
-
-
-def _append_step(steps: list[TraceStep], step: TraceStep) -> None:
-    steps.append(step)
-
-
-def _format_repair_history(history: Sequence[RepairAttempt]) -> str:
-    return "\n".join(
-        f"- 第 {item.attempt} 次：{item.error}" for item in history
-    )
+        answer = state.get("answer")
+        if answer is None:
+            raise RuntimeError("编排未产出结果")
+        self._last_trace = answer.trace
+        return answer
 
 
 def _match_option(request: ClarificationRequest, value: str) -> ClarificationOption:
@@ -579,11 +260,4 @@ def _match_option(request: ClarificationRequest, value: str) -> ClarificationOpt
     raise ValueError(f"无效的澄清选项: {value!r}")
 
 
-def format_result_table(frame: pd.DataFrame, *, max_rows: int = 20) -> str:
-    """把结果 DataFrame 渲染成可直接展示的文本表格。"""
-    if frame.empty:
-        return "（查询结果为空）"
-    table = cast(str, frame.head(max_rows).to_string(index=False))
-    if len(frame) > max_rows:
-        table += f"\n… 仅显示前 {max_rows} 行，共 {len(frame)} 行"
-    return table
+__all__ = ["Answer", "Clarification", "Orchestrator", "format_result_table"]

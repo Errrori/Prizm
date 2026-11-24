@@ -255,11 +255,20 @@
 - 还清记录：—
 
 ### DEBT-028 LangGraph 骨架未接入主链路且能力不完整
-- 状态：未还
+- 状态：已还清
 - 现状：新增 `agent/graph.py` 用 LangGraph `StateGraph` 编排分析链路，但尚未替换 `Orchestrator`，`app/main.py` 与 `eval/` 仍走旧同步编排；未使用 HITL `interrupt`/`Command(resume)`、checkpointer（多轮记忆/持久化）与图级流式 `astream`，结论 token 未逐块输出；图内重试边与 `Repairer` 逻辑重复。
 - 为什么简化：评估后选用 LangChain 优化，本轮按“先只搭骨架”交付，控制对 363 项单测与 150 题评测的影响，先验证图结构与 LangChain 适配层。
 - 触发条件：下次要对外演示/报告 LangGraph 能力前，或需把图接入 Orchestrator/app/eval 时。
 - 涉及文件：src/prizm/agent/graph.py, src/prizm/llm/langchain_adapter.py, src/prizm/agent/orchestrator.py, app/main.py, eval/run_eval.py
+- 登记日期：2026-11-24
+- 还清记录：2026-11-24 任务 13-1：图接入 Orchestrator，`ask`/`resolve` 走 `interrupt`/`Command(resume=...)`，`MemorySaver(pickle_fallback)` checkpointer，进度走 `stream_mode="custom"`；剩余重试逻辑重复与进程内 checkpointer 另立 DEBT-029。commit 见本任务 git log。
+
+### DEBT-029 图内重试逻辑与 Repairer 重复，checkpointer 为进程内
+- 状态：未还
+- 现状：`agent/graph.py` 的 plan/execute 条件重试与 `agent/repair.py` 的 `Repairer` 逻辑重复；checkpointer 为进程内 `MemorySaver(serde=JsonPlusSerializer(pickle_fallback=True))`，进程重启会话状态丢失，且把 `DataFrame`/`Answer` 以 pickle 存入 checkpoint；150 题真实模型评测在本轮未复跑，指标未重新验证。
+- 为什么简化：先保证主链路切换与 365 项单测全绿，避免重写 `Repairer` 或引入持久化 checkpointer 与额外依赖。
+- 触发条件：需要跨重启恢复会话/多副本部署前，或对外正式报告 150 题评测指标前。
+- 涉及文件：src/prizm/agent/graph.py, src/prizm/agent/repair.py, src/prizm/agent/orchestrator.py, eval/run_eval.py
 - 登记日期：2026-11-24
 - 还清记录：—
 

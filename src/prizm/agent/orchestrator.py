@@ -205,7 +205,8 @@ class Orchestrator:
             prior_steps = list(self._last_trace.steps)
             prior_references = self._last_trace.profile_references
         steps = list(prior_steps)
-        _append_step(steps, step, progress)
+        _append_step(steps, step)
+        _emit_step(progress, step)
         pending.advance()
         references = _merge_references(
             prior_references,
@@ -234,29 +235,25 @@ class Orchestrator:
         )
         if decision.needs_clarification:
             reasons = "；".join(request.reason for request in decision.requests)
-            _append_step(
-                steps,
-                TraceStep(
-                    "体检与澄清判定",
-                    "clarify",
-                    f"触发 {len(decision.requests)} 项澄清，暂不执行",
-                    detail=reasons,
-                ),
-                progress,
+            step = TraceStep(
+                "体检与澄清判定",
+                "clarify",
+                f"触发 {len(decision.requests)} 项澄清，暂不执行",
+                detail=reasons,
             )
+            _append_step(steps, step)
+            _emit_step(progress, step)
             self._pending = _PendingClarification(question, decision.requests)
             trace = self._clarification_trace(self._pending, steps, references)
             self._last_trace = trace
             return self._as_clarification(self._pending, trace)
-        _append_step(
-            steps,
-            TraceStep(
-                "体检与澄清判定",
-                "ok",
-                f"体检 {len(self._profile.anomalies)} 条异常，无新增待澄清项，进入规划",
-            ),
-            progress,
+        step = TraceStep(
+            "体检与澄清判定",
+            "ok",
+            f"体检 {len(self._profile.anomalies)} 条异常，无新增待澄清项，进入规划",
         )
+        _append_step(steps, step)
+        _emit_step(progress, step)
         return self._execute(question, steps, references, progress=progress)
 
     def _execute(
@@ -280,6 +277,7 @@ class Orchestrator:
                 ),
                 confirmed_policies=policies or None,
                 conversation_summary=self._memory.format_for_prompt(),
+                progress=progress,
             )
         except RepairFailed as exc:
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -292,7 +290,6 @@ class Orchestrator:
                     f"已尝试 {exc.attempts} 次仍未成功",
                     detail=_format_repair_history(exc.history) or exc.last_error,
                 ),
-                progress,
             )
             self._last_trace = Trace(
                 question=question,
@@ -309,19 +306,16 @@ class Orchestrator:
         _append_step(
             steps,
             TraceStep("SQL 规划", "ok", "已生成只读 SQL", detail=outcome.plan.sql),
-            progress,
         )
         if outcome.attempts > 1:
-            _append_step(
-                steps,
-                TraceStep(
-                    "自修复",
-                    "repaired",
-                    f"第 {outcome.attempts} 次尝试成功",
-                    detail=_format_repair_history(outcome.history) or None,
-                ),
-                progress,
+            repaired_step = TraceStep(
+                "自修复",
+                "repaired",
+                f"第 {outcome.attempts} 次尝试成功",
+                detail=_format_repair_history(outcome.history) or None,
             )
+            _append_step(steps, repaired_step)
+            _emit_step(progress, repaired_step)
         dataframe = outcome.dataframe
         _append_step(
             steps,
@@ -330,23 +324,24 @@ class Orchestrator:
                 "ok",
                 f"返回 {len(dataframe)} 行 × {len(dataframe.columns)} 列",
             ),
-            progress,
         )
 
         chart_spec, chart_payload, chart_png, chart_step = _render_plan_chart(
             outcome.plan.chart, dataframe
         )
         if chart_step is not None:
-            _append_step(steps, chart_step, progress)
+            _append_step(steps, chart_step)
+            _emit_step(progress, chart_step)
 
         if self._conclusion_composer is None:
             conclusion = Conclusion(template_conclusion(dataframe))
-            _append_step(
-                steps,
-                TraceStep("结论生成", "ok", "使用模板结论（未启用模型归纳）"),
-                progress,
+            conclusion_step = TraceStep(
+                "结论生成", "ok", "使用模板结论（未启用模型归纳）"
             )
+            _append_step(steps, conclusion_step)
+            _emit_step(progress, conclusion_step)
         else:
+            _start_step(progress, "结论生成", "正在归纳结论…")
             token_callback: TokenSink | None = None
             if progress is not None:
 
@@ -363,27 +358,21 @@ class Orchestrator:
                 on_token=token_callback,
             )
             if conclusion.source == "llm":
-                _append_step(
-                    steps,
-                    TraceStep(
-                        "结论生成",
-                        "ok",
-                        "已用模型归纳结果",
-                        detail=conclusion.text,
-                    ),
-                    progress,
+                conclusion_step = TraceStep(
+                    "结论生成",
+                    "ok",
+                    "已用模型归纳结果",
+                    detail=conclusion.text,
                 )
             else:
-                _append_step(
-                    steps,
-                    TraceStep(
-                        "结论生成",
-                        "fallback",
-                        "模型结论不可用，已回退模板",
-                        detail=conclusion.fallback_reason,
-                    ),
-                    progress,
+                conclusion_step = TraceStep(
+                    "结论生成",
+                    "fallback",
+                    "模型结论不可用，已回退模板",
+                    detail=conclusion.fallback_reason,
                 )
+            _append_step(steps, conclusion_step)
+            _emit_step(progress, conclusion_step)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
         trace = Trace(
@@ -552,6 +541,12 @@ def _merge_references(
     return tuple(merged)
 
 
+def _start_step(progress: ProgressSink | None, name: str, summary: str) -> None:
+    if progress is None:
+        return
+    progress(ProgressEvent(kind="step_start", name=name, summary=summary))
+
+
 def _emit_step(progress: ProgressSink | None, step: TraceStep) -> None:
     if progress is None:
         return
@@ -566,13 +561,8 @@ def _emit_step(progress: ProgressSink | None, step: TraceStep) -> None:
     )
 
 
-def _append_step(
-    steps: list[TraceStep],
-    step: TraceStep,
-    progress: ProgressSink | None,
-) -> None:
+def _append_step(steps: list[TraceStep], step: TraceStep) -> None:
     steps.append(step)
-    _emit_step(progress, step)
 
 
 def _format_repair_history(history: Sequence[RepairAttempt]) -> str:

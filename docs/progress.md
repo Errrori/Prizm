@@ -27,7 +27,7 @@ MVP、150 题评测集、流式反馈与真实模型复跑已完成；剩余演�
 - 任务 8-1：结构化 chart spec + matplotlib PNG + LLM 结论（模板兜底）
 - 任务 9-1：真实模型评测 70% 一次成功 / 90% 自修复后；SQLite 额度台账；litellm 不读 .env；README + Dockerfile（非 root/只读/CJK 字体）
 - 任务 10-1：评测集扩至 150 题（orders 55 / monthly 48 / traffic 47，含脏数据变体），多轮会话串接，异常检出率指标接通
-- 任务 11-1：流式过程反馈——LLM 适配器流式、结论逐 token 回调、编排步骤事件、Chainlit 线程+异步队列实时渲染，还清 DEBT-020
+- 任务 11-1：流式过程反馈——LLM 适配器流式、结论逐 token 回调、编排步骤开始/结束双事件、`app/streaming.py` 线程+异步队列实时渲染，含 UI 桥接异步单测，还清 DEBT-020
 - 任务 11-2：真实模型（glm-4-flashx-250414）复跑 150 题——一次 83.3%（125/150，达标≥75%）、自修复后 86.0%（129/150，未达≥90%）、异常检出 100%（12/12）、澄清触发 100%（150/150）；2 题 3 次仍失败，19 题答案不一致
 
 ## 进行中
@@ -52,6 +52,6 @@ MVP、150 题评测集、流式反馈与真实模型复跑已完成；剩余演�
 ## 关键入口
 - 需求：docs/requirements.md ｜ 架构：docs/architecture.md
 - 技术债：docs/debts.md ｜ 待办：docs/backlog.md
-- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 328 项）｜ 启动：`uv run chainlit run app/main.py`
+- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 332 项）｜ 启动：`uv run chainlit run app/main.py`
 - 容器：`docker build -t prizm .` 后 `docker run --rm -p 8000:8000 --env-file .env -v prizm-data:/data prizm`
 - 评测：`uv run python -m eval.build_tasks`、`-m eval.run_eval --execute`、`-m eval.run_clarify`、`-m eval.run_rag`

@@ -14,6 +14,7 @@ import duckdb
 import pandas as pd
 
 from prizm.agent.planner import Plan, Planner, PlanParseError
+from prizm.agent.progress import ProgressEvent, ProgressSink
 from prizm.engine.duckdb_engine import DuckDBEngine, QueryTimeoutError, SQLValidationError
 
 MAX_REPAIR_ATTEMPTS = 3
@@ -66,6 +67,30 @@ def format_repair_error(exc: BaseException) -> str:
     return text
 
 
+def _emit_start(progress: ProgressSink | None, name: str, summary: str) -> None:
+    if progress is not None:
+        progress(ProgressEvent(kind="step_start", name=name, summary=summary))
+
+
+def _emit_end(
+    progress: ProgressSink | None,
+    name: str,
+    status: str,
+    summary: str,
+    detail: str | None = None,
+) -> None:
+    if progress is not None:
+        progress(
+            ProgressEvent(
+                kind="step",
+                name=name,
+                status=status,
+                summary=summary,
+                detail=detail,
+            )
+        )
+
+
 def build_repair_feedback(*, attempt: int, failed_sql: str | None, error: str) -> str:
     parts = [f"第 {attempt} 次尝试失败。", f"错误：{error}"]
     if failed_sql:
@@ -102,6 +127,7 @@ class Repairer:
         profile_summary: str | None = None,
         confirmed_policies: Mapping[str, str] | None = None,
         conversation_summary: str | None = None,
+        progress: ProgressSink | None = None,
     ) -> RepairResult:
         history: list[RepairAttempt] = []
         feedback: str | None = None
@@ -109,6 +135,11 @@ class Repairer:
 
         for attempt in range(1, self.max_attempts + 1):
             plan: Plan | None = None
+            _emit_start(
+                progress,
+                "SQL 规划",
+                "正在生成 SQL…" if attempt == 1 else f"第 {attempt} 次重新生成 SQL…",
+            )
             try:
                 plan = self.planner.plan(
                     question,
@@ -119,7 +150,15 @@ class Repairer:
                     conversation_summary=conversation_summary,
                     repair_feedback=feedback,
                 )
+                _emit_end(progress, "SQL 规划", "ok", "已生成只读 SQL", plan.sql)
+                _emit_start(progress, "执行", "正在执行 SQL…")
                 dataframe = self.engine.execute(plan.sql)
+                _emit_end(
+                    progress,
+                    "执行",
+                    "ok",
+                    f"返回 {len(dataframe)} 行 × {len(dataframe.columns)} 列",
+                )
                 return RepairResult(
                     plan=plan,
                     dataframe=dataframe,
@@ -129,6 +168,10 @@ class Repairer:
             except _RETRYABLE_ERRORS as exc:
                 last_error = format_repair_error(exc)
                 failed_sql = plan.sql if plan is not None else None
+                if plan is None:
+                    _emit_end(progress, "SQL 规划", "failed", "SQL 生成失败", last_error)
+                else:
+                    _emit_end(progress, "执行", "failed", "SQL 执行失败", last_error)
                 history.append(
                     RepairAttempt(attempt=attempt, sql=failed_sql, error=last_error)
                 )
@@ -139,6 +182,13 @@ class Repairer:
                         last_error=last_error,
                         history=tuple(history),
                     ) from exc
+                _emit_end(
+                    progress,
+                    "自修复",
+                    "retrying",
+                    f"第 {attempt} 次失败，准备重试",
+                    last_error,
+                )
                 feedback = build_repair_feedback(
                     attempt=attempt,
                     failed_sql=failed_sql,

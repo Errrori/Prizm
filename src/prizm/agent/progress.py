@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
-ProgressKind = Literal["step", "conclusion_token"]
+ProgressKind = Literal["step_start", "step", "conclusion_token"]
 
 
 @dataclass(frozen=True, slots=True)

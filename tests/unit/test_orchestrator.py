@@ -477,6 +477,8 @@ def test_orchestrator_emits_progress_events(tmp_path: Path) -> None:
 
     step_names = [event.name for event in events if event.kind == "step"]
     assert step_names == ["体检与澄清判定", "SQL 规划", "执行", "结论生成"]
+    start_names = [event.name for event in events if event.kind == "step_start"]
+    assert start_names == ["SQL 规划", "执行", "结论生成"]
 
     tokens = "".join(event.text for event in events if event.kind == "conclusion_token")
     assert tokens == "销售额合计 300。"

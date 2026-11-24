@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from prizm.agent.planner import Planner
+from prizm.agent.progress import ProgressEvent
 from prizm.agent.repair import (
     MAX_REPAIR_ATTEMPTS,
     Repairer,
@@ -224,3 +225,30 @@ def test_build_repair_feedback_includes_error_and_sql() -> None:
     assert "第 1 次尝试失败" in feedback
     assert "BinderException: bad" in feedback
     assert "SELECT bad FROM orders" in feedback
+
+
+def test_repairer_emits_step_start_and_end_events() -> None:
+    bad_sql = "SELECT missing_column FROM orders"
+    good_sql = "SELECT SUM(sales) AS total FROM orders"
+    llm = ScriptedLLM([plan(bad_sql), plan(good_sql)])
+    data = frame()
+    events: list[ProgressEvent] = []
+
+    with DuckDBEngine() as engine:
+        engine.register_dataframe("orders", data)
+        result = Repairer(Planner(llm), engine).run(
+            "销售额", "orders", data, progress=events.append
+        )
+
+    assert result.attempts == 2
+    assert any(e.kind == "step_start" and e.name == "SQL 规划" for e in events)
+    assert any(e.kind == "step" and e.name == "SQL 规划" for e in events)
+    assert any(e.kind == "step_start" and e.name == "执行" for e in events)
+    assert any(
+        e.kind == "step" and e.name == "执行" and e.status == "failed"
+        for e in events
+    )
+    assert any(
+        e.kind == "step" and e.name == "执行" and e.status == "ok" for e in events
+    )
+    assert any(e.kind == "step" and e.name == "自修复" for e in events)

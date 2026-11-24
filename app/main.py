@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import chainlit as cl
 import duckdb
+from app.streaming import run_streamed
 
 from prizm.agent.clarify import ClarifyGate, LLMAmbiguityJudge
 from prizm.agent.composer import ConclusionComposer
@@ -18,7 +18,6 @@ from prizm.agent.orchestrator import (
     format_result_table,
 )
 from prizm.agent.planner import Planner, build_mock_plan_response
-from prizm.agent.progress import ProgressEvent
 from prizm.agent.repair import RepairFailed
 from prizm.agent.trace import Trace
 from prizm.config import get_settings
@@ -163,7 +162,7 @@ async def on_message(message: cl.Message) -> None:
     result: Answer | Clarification | DictionaryAnswer
     streamed: cl.Message | None = None
     try:
-        result, streamed = await _run_streamed(orchestrator.ask, message.content)
+        result, streamed = await run_streamed(orchestrator.ask, message.content)
         while isinstance(result, Clarification):
             response = await cl.AskActionMessage(
                 content=(f"{result.request.question}\n\n依据：{result.request.reason}"),
@@ -181,7 +180,7 @@ async def on_message(message: cl.Message) -> None:
             if selected is None:
                 await cl.Message(content="未收到有效选择，已取消本次分析。").send()
                 return
-            result, streamed = await _run_streamed(orchestrator.resolve, selected)
+            result, streamed = await run_streamed(orchestrator.resolve, selected)
     except QuotaExceededError:
         await cl.Message(content="今日模型额度已用完，请明天再试，或改用你自己的 API key。").send()
         return
@@ -279,60 +278,6 @@ async def _ask_choice(title: str, options: Sequence[tuple[str, str]]) -> str | N
         ],
     ).send()
     return _selected_value(response)
-
-
-async def _run_streamed(
-    call: Callable[..., Answer | Clarification | DictionaryAnswer],
-    *args: Any,
-) -> tuple[Answer | Clarification | DictionaryAnswer, cl.Message | None]:
-    """在线程里跑同步编排，经异步队列把进度实时渲染成步骤与结论 token。
-
-    编排产生的进度事件来自 :class:`ProgressEvent`；步骤逐个出现，
-    结论通过 ``cl.Message.stream_token`` 逐字输出。返回最终的流式结论消息，
-    以便在编排结束后用权威文本校正（模型失败回退模板时尤其需要）。
-    """
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[ProgressEvent | None] = asyncio.Queue()
-
-    def emit(event: ProgressEvent) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
-
-    parent = cl.Step(name="分析过程", type="tool", auto_collapse=True)
-    await parent.send()
-    child_count = 0
-    conclusion_msg: cl.Message | None = None
-
-    async def consume() -> None:
-        nonlocal child_count, conclusion_msg
-        while True:
-            event = await queue.get()
-            if event is None:
-                return
-            if event.kind == "step":
-                step = cl.Step(name=event.name, type="tool", parent_id=parent.id)
-                await step.send()
-                step.output = event.detail or event.summary
-                await step.update()
-                child_count += 1
-            elif event.kind == "conclusion_token":
-                if conclusion_msg is None:
-                    conclusion_msg = cl.Message(content="**结论**\n")
-                    await conclusion_msg.send()
-                await conclusion_msg.stream_token(event.text)
-
-    consumer = asyncio.create_task(consume())
-    try:
-        result = await asyncio.to_thread(call, *args, progress=emit)
-    finally:
-        loop.call_soon_threadsafe(queue.put_nowait, None)
-        await consumer
-
-    parent.output = f"共 {child_count} 步"
-    await parent.update()
-    if conclusion_msg is not None and isinstance(result, Answer):
-        conclusion_msg.content = f"**结论**\n{result.conclusion or '（本次未生成结论）'}"
-        await conclusion_msg.update()
-    return result, conclusion_msg
 
 
 def _trace_elements(trace: Trace | None) -> list[Any]:

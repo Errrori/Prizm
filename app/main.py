@@ -182,8 +182,7 @@ async def on_message(message: cl.Message) -> None:
                 return
             result, streamed = await run_streamed(orchestrator.resolve, selected)
     except QuotaExceededError:
-        # DEBT-027: 未实现用户自带 key 的会话输入, 仅提示改用环境变量配置。
-        await cl.Message(content="今日模型额度已用完，请明天再试，或改用你自己的 API key。").send()
+        await cl.Message(content="今日模型额度已用完，请明天再试。").send()
         return
     except RepairFailed as exc:
         await cl.Message(

@@ -36,7 +36,7 @@
 | 沙箱 | SQL 路径用 DuckDB 限额；pandas 兜底用子进程 + AST/import 白名单 + 超时；Docker 兜底隔离 | 见 ADR-0004 |
 | 检索 | **BM25 起步**；向量 + rerank 设为可选 extra | **简化**：不默认上三件套，见 ADR-0006 |
 | 图表 | matplotlib（Agg）→ PNG，输入为 **chart spec** 而非代码 | 模板化渲染，避免任意绘图代码 |
-| 配置/密钥 | pydantic-settings + `.env`；key 只读 env / 会话内存 | 不落盘、不打日志 |
+| 配置/密钥 | pydantic-settings + `.env`；key 只读 env | 不落盘、不打日志 |
 | 测试/评测 | pytest（单测/集成）+ 独立 `eval/`（统计性，默认不进 CI） | 见第 6 节 |
 | 容器 | Dockerfile（非 root、`/data` 持久化、支持只读根文件系统；仅 LLM 需出网） | 兼作运行隔离；见 ADR-0008 |
 
@@ -138,7 +138,7 @@ flowchart TD
 
 ## 6. 不变量（不可违背）
 
-- **密钥**：仅来自环境变量或会话输入，只存内存；不落盘、不打日志、不进仓库。
+- **密钥**：仅来自环境变量，只存内存；不落盘、不打日志、不进仓库。
 - **执行**：默认无自由代码执行；SQL 只读 + 限额；pandas 兜底必须过白名单与超时。
 - **评测与单测分离**：`unit`/`integration` 确定性、可 mock LLM、进 CI；`eval` 统计性、慢、默认排除（`-m 'not eval'`）。`eval/run_eval.py --execute` 需要真实模型 key，只用于阶段性验收，不进入默认 CI。
 - **单一事实源**：依赖/版本只在 `pyproject.toml`；本文只记为什么。

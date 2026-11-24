@@ -192,5 +192,5 @@
 
 - 代码仓库（含 pytest 测试、Dockerfile）
 
-- README：架构图 \+ 演示 GIF \+ 评测结果表
+- README：架构图 + 评测结果表
 

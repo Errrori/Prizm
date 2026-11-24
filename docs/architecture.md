@@ -163,7 +163,7 @@ flowchart TD
 Prizm/
 ├─ pyproject.toml            # 机器真相：依赖 / 版本 / 工具配置
 ├─ Dockerfile                # 非 root + 禁网 + 只读（兼沙箱隔离）
-├─ README.md                 # 架构图 + 演示 GIF + 评测结果
+├─ README.md                 # 架构图 + 评测结果
 ├─ .env.example              # 模型 / 额度配置，不含真实 key
 ├─ docs/
 │  ├─ Architecture.md        # 本文件：决策真相

@@ -254,5 +254,14 @@
 - 登记日期：2026-11-24
 - 还清记录：—
 
+### DEBT-028 LangGraph 骨架未接入主链路且能力不完整
+- 状态：未还
+- 现状：新增 `agent/graph.py` 用 LangGraph `StateGraph` 编排分析链路，但尚未替换 `Orchestrator`，`app/main.py` 与 `eval/` 仍走旧同步编排；未使用 HITL `interrupt`/`Command(resume)`、checkpointer（多轮记忆/持久化）与图级流式 `astream`，结论 token 未逐块输出；图内重试边与 `Repairer` 逻辑重复。
+- 为什么简化：评估后选用 LangChain 优化，本轮按“先只搭骨架”交付，控制对 363 项单测与 150 题评测的影响，先验证图结构与 LangChain 适配层。
+- 触发条件：下次要对外演示/报告 LangGraph 能力前，或需把图接入 Orchestrator/app/eval 时。
+- 涉及文件：src/prizm/agent/graph.py, src/prizm/llm/langchain_adapter.py, src/prizm/agent/orchestrator.py, app/main.py, eval/run_eval.py
+- 登记日期：2026-11-24
+- 还清记录：—
+
 
 

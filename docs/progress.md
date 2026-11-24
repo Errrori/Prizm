@@ -11,6 +11,7 @@
 
 ## 当前阶段
 MVP、150 题评测集、流式反馈、真实模型全量复跑与答案一致性提优均已完成；
+LangChain/LangGraph 骨架已落地（评估后选用 LangChain 优化，未接入主链路）。
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -29,13 +30,14 @@ MVP、150 题评测集、流式反馈、真实模型全量复跑与答案一致�
 - 任务 10-1：评测集扩至 150 题，多轮会话串接，异常检出率指标接通
 - 任务 11-1/11-2：流式过程反馈；真实模型 150 题复跑（一次 83.3%、自修复后 86.0%）
 - 任务 12-1：失败归因与答案一致性提优——新增 `--ids/--diagnostics`；planner 约束月份 YYYY-MM、差值方向 A-B、单行单列、COUNT(*)、CTE 最终 SELECT；repair 按错误类型加提示；全量 150 题一次 98.0%（147/150）、自修复后 99.3%（149/150）、异常 100%、澄清 100%；修正 tra-043 标准答案 1744→949
+- 任务 13-1：评估后选用 LangChain 优化——LangChain/LangGraph 骨架：新增 `llm/langchain_adapter.py`（ChatLiteLLM 实现 LLMAdapter 协议）与 `agent/graph.py`（StateGraph：澄清→规划→执行→条件重试→图表→结论→记忆），新增 17 项单测；暂未替换 Orchestrator（DEBT-028）
 
 
 ## 进行中
 - 无
 
 ## 下一步
-- 无（后续按新任务安排）
+- 将 LangGraph 图接入 Orchestrator/app/eval，补 `interrupt`/checkpointer 与图级流式（DEBT-028）
 
 ## 阻塞与风险
 - 非阻塞：ord-021 偶发差值只返回单边值（1/150，DEBT-026）
@@ -48,7 +50,7 @@ MVP、150 题评测集、流式反馈、真实模型全量复跑与答案一致�
 ## 关键入口
 - 需求：docs/requirements.md ｜ 架构：docs/architecture.md
 - 技术债：docs/debts.md ｜ 待办：docs/backlog.md
-- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 346 项）｜ 启动：`uv run chainlit run app/main.py`
+- 测试：`uv run pytest`（本机 `.venv\Scripts\python.exe -m pytest`，当前 363 项）｜ 启动：`uv run chainlit run app/main.py`
 - 容器：`docker build -t prizm .` 后 `docker run --rm -p 8000:8000 --env-file .env -v prizm-data:/data prizm`
 - 评测：`uv run python -m eval.build_tasks`、`-m eval.run_eval --execute`、`-m eval.run_clarify`、`-m eval.run_rag`
 - 失败归因：`python -m eval.run_eval --execute --ids "id1,id2" --diagnostics eval/outcomes/diag.jsonl`

@@ -40,6 +40,8 @@
 | 测试/评测 | pytest（单测/集成）+ 独立 `eval/`（统计性，默认不进 CI） | 见第 6 节 |
 | 容器 | Dockerfile（非 root、`/data` 持久化、支持只读根文件系统；仅 LLM 需出网） | 兼作运行隔离；见 ADR-0008 |
 
+评估后选用 LangChain 优化（骨架阶段）：新增 `llm/langchain_adapter.py`，用 `ChatLiteLLM` 实现同一个 `LLMAdapter` 协议；新增 `agent/graph.py`，用 LangGraph `StateGraph` 编排分析链路（含条件重试边），暂未替换现有 `Orchestrator`，见 ADR-0009。
+
 ## 3. 架构总览
 
 ```mermaid
@@ -136,6 +138,13 @@ flowchart TD
 - **代价**：跨主机多副本需共享 `/data` 卷；CJK 字体使镜像增大约 90MB；`--read-only` 需要额外 tmpfs。
 - **重估条件**：多主机/多租户部署，或需要按费用精确计量时。
 
+### ADR-0009 编排迁移：LangGraph 骨架（混合式）
+- **决策**：新增 LangGraph `StateGraph` 作为编排骨架（`agent/graph.py`：clarify → plan → execute →（条件边重试）→ chart → conclude → finalize），并新增 `llm/langchain_adapter.py` 用 `ChatLiteLLM` 实现既有 `LLMAdapter` 协议；领域模块（profiler / planner / repair / engine / charts / composer / trace）保留为节点内核，`Orchestrator` 对外签名暂不变。
+- **理由**：评估后选用 LangChain 优化，把“编排”换成显式状态图与条件边，便于表达澄清短路、失败重试与后续 human-in-the-loop/持久化；领域模块与既有 `LLMAdapter`/`Orchestrator` 契约保持不变，回归面可控。
+- **被否**：① 全面 LangChain 化（prompt/输出解析/RAG/记忆全部换原生组件）——回归面大、评测指标风险高；② 只加依赖不改代码——无法在代码层验证状态图能力。
+- **代价**：骨架阶段重试边与 `Repairer` 逻辑重复；暂未接入 HITL `interrupt`、checkpointer 与图级流式；未替换 Orchestrator（见 DEBT-028）。
+- **重估条件**：需要把图接入 `Orchestrator`/`app`/`eval` 真正替换旧编排，或要展示 human-in-the-loop 与持久化记忆时。
+
 ## 6. 不变量（不可违背）
 
 - **密钥**：仅来自环境变量，只存内存；不落盘、不打日志、不进仓库。
@@ -174,10 +183,11 @@ Prizm/
 ├─ src/prizm/
 │  ├─ config.py              # pydantic-settings
 │  ├─ llm/adapter.py         # litellm 封装（stream / retry / 额度）
+│  ├─ llm/langchain_adapter.py# ChatLiteLLM → 同一 LLMAdapter 协议（LangChain 骨架）
 │  ├─ datasource/            # base / csv / excel / sqlite connector
 │  ├─ engine/duckdb_engine.py# SQL 执行 + 限额
 │  ├─ profiling/             # profiler / checks / models
-│  ├─ agent/                 # orchestrator / clarify / planner / repair / memory / trace / composer / prompts
+│  ├─ agent/                 # orchestrator / clarify / planner / repair / memory / trace / composer / prompts / graph（LangGraph 骨架）
 │  ├─ sandbox/               # policy / executor / runner（pandas 兜底）
 │  ├─ rag/                   # index / retriever / ingest
 │  ├─ viz/charts.py          # chart spec → matplotlib PNG
@@ -211,3 +221,5 @@ Prizm/
 - `prizm.profiling.profiler`：`ProfileOptions(sample_rows / top_values / max_examples / dirty_ratio_threshold / max_prompt_chars)`、`profile_frame(frame, *, primary_key=None, options=None) -> ProfileReport`、`format_profile_report`（UI 展示）、`format_profile_prompt`（prompt 注入，硬上限截断）。检测缺失（NaN/空串/空白）、完全重复、疑似主键重复（未指定时按 `id` / `*_id` 自动识别）与数值脏格式（千分位/货币符/单位/百分号）。
 - 入口 `app/main.py`：Chainlit 上传 CSV / Excel(.xlsx) / SQLite（可选同时上传 .md/.txt 数据说明）→ 注册 DuckDB → 生成并展示体检报告与数据字典 → 提问；Excel 多工作表或 SQLite 多表时用动作消息让用户选一个；术语问题走 RAG 展示带出处的字典片段，分析问题展示结论 + 图表（`cl.Image`）+ SQL + 结果；真实模型模式挂载 `ConclusionComposer`，mock 模式用模板结论；用量台账按 `PRIZM_USAGE_LEDGER_PATH` 落 SQLite；`app/streaming.py` 的 `run_streamed` 把同步编排放到 `asyncio.to_thread` 运行，`progress` 事件经 `asyncio.Queue` 桥接：`step_start` 创建“进行中”的嵌套 `cl.Step`、`step` 按名称更新同一个步骤、结论用 `cl.Message.stream_token` 逐字输出并在结束后按权威文本校正（回退模板时亦一致），并用侧栏 `cl.Text` 展示透明面板（执行状态、生成 SQL、引用体检结论、已确认口径、图表/结论/尝试/修复记录）；`RepairFailed` 时展示最终错误与失败面板；mock 模式返回 `SELECT * FROM "<view>" LIMIT 5`。
 - 交付：`Dockerfile` 基于 `python:3.11-slim` + `uv.lock`，安装 Noto CJK 字体，非 root（uid 10001）、`/data` 持久化、`CHAINLIT_APP_ROOT=/data`，支持只读根文件系统；`README.md` 含架构图、快速开始、安全说明与最小评测结果。
+- `prizm.llm.langchain_adapter`：`LangChainLLMAdapter(chat, *, ledger=None, daily_token_budget=None)` 实现 `LLMAdapter`（`complete` / `stream`），把 dict 消息转 LangChain 消息、从 `usage_metadata` 取 token、按额度台账记账；`build_langchain_llm(settings, *, chat=None, response=None, ledger=None, daily_token_budget=None)` 在 mock 模式返回 `MockLLM`，支持注入 `chat` 单测，真实模式惰性导入 `ChatLiteLLM`。类型/文本提取辅助：`extract_usage`、`extract_text`。
+- `prizm.agent.graph`：`AnalysisState`（TypedDict）、`AnalysisDeps(planner, engine, frame, view_name, *, profile_summary, confirmed_policies, conversation_summary, composer, clarify_gate, profile, progress, max_attempts)`、`build_analysis_graph(deps, *, memory=None)` 返回编译后的 `StateGraph`、`run_analysis_graph(question, *, deps, memory=None) -> Answer | Clarification`。图节点：clarify（命中门禁直接返回 Clarification，不进规划）→ plan → execute →（失败且未达 `max_attempts` 走条件边回 plan，错误与修复提示写入 state）→ chart（图表失败只记 trace，不阻断）→ conclude（composer 缺失或回退走模板）→ finalize（追加 memory `Turn`）；耗尽重试抛 `RepairFailed`。骨架阶段未接入 `Orchestrator`、`interrupt`/checkpointer 与图级流式。

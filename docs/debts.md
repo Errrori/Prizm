@@ -270,7 +270,7 @@
 - 触发条件：需要跨重启恢复会话/多副本部署前，或对外正式报告 150 题评测指标前。
 - 涉及文件：src/prizm/agent/graph.py, src/prizm/agent/repair.py, src/prizm/agent/orchestrator.py, eval/run_eval.py
 - 登记日期：2026-11-24
-- 还清记录：—
+- 还清记录：（未还清，仅记录）2026-11-25 任务 14-1：LangGraph 主链路全量 150 题复跑，一次 98.0%（147/150）/自修复后 99.3%（149/150）、异常 100%、澄清 100%，与切换前一致；重试去重与持久化 checkpointer 仍未做。
 
 
 

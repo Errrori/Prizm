@@ -11,7 +11,8 @@
 
 ## 当前阶段
 MVP、150 题评测集、流式反馈、真实模型全量复跑与答案一致性提优均已完成；
-LangChain/LangGraph 已接入主链路（interrupt/resume、checkpointer、custom stream）。
+LangChain/LangGraph 已接入主链路（interrupt/resume、checkpointer、custom stream），
+并完成全量 150 题复跑，指标与切换前一致、无回退。
 
 ## 已完成
 - 任务 0-1：项目骨架，pytest 可运行
@@ -30,17 +31,18 @@ LangChain/LangGraph 已接入主链路（interrupt/resume、checkpointer、custo
 - 任务 10-1：评测集扩至 150 题，多轮会话串接，异常检出率指标接通
 - 任务 11-1/11-2：流式过程反馈；真实模型 150 题复跑（一次 83.3%、自修复后 86.0%）
 - 任务 12-1：失败归因与答案一致性提优——新增 `--ids/--diagnostics`；planner 约束月份 YYYY-MM、差值方向 A-B、单行单列、COUNT(*)、CTE 最终 SELECT；repair 按错误类型加提示；全量 150 题一次 98.0%（147/150）、自修复后 99.3%（149/150）、异常 100%、澄清 100%；修正 tra-043 标准答案 1744→949
-- 任务 13-1：评估后选用 LangChain 优化——`llm/langchain_adapter.py`（ChatLiteLLM→LLMAdapter）、`agent/graph.py`（LangGraph StateGraph：clarify interrupt → plan → execute 条件重试 → chart → conclude → memory）、`agent/results.py`、`rag/langchain_retriever.py`；`Orchestrator` 改为图薄封装，进度走 `stream_mode="custom"`；365 项单测全绿；真实模型 10 题冒烟 10/10（一次成功/自修复/异常/澄清 100%），150 题全量未复跑（DEBT-029）
+- 任务 13-1：评估后选用 LangChain 优化——`llm/langchain_adapter.py`（ChatLiteLLM→LLMAdapter）、`agent/graph.py`（LangGraph StateGraph：clarify interrupt → plan → execute 条件重试 → chart → conclude → memory）、`agent/results.py`、`rag/langchain_retriever.py`；`Orchestrator` 改为图薄封装，进度走 `stream_mode="custom"`；365 项单测全绿；真实模型 10 题冒烟 10/10（一次成功/自修复/异常/澄清 100%）
+- 任务 14-1：LangGraph 主链路全量 150 题复跑——一次 98.0%（147/150）、自修复后 99.3%（149/150）、异常 100%、澄清 100%，与切换前完全一致；唯一失败 ord-021（DEBT-025），tra-017/tra-029 自修复后通过
 
 
 ## 进行中
 - 无
 
 ## 下一步
-- 可选：跑 150 题全量确认指标不回退；清理重试逻辑重复与进程内 checkpointer（DEBT-029）
+- 还 DEBT-029：合并图内重试与 Repairer 重复、换持久化 checkpointer
 
 ## 阻塞与风险
-- 非阻塞：DEBT-029 图内重试与 Repairer 重复、checkpointer 进程内 pickle；10 题冒烟通过，150 题全量未跑
+- 非阻塞：DEBT-029 图内重试与 Repairer 重复、checkpointer 进程内 pickle；150 题全量已验证无回退，代码问题未还
 - 非阻塞：ord-021 偶发差值只返回单边值（1/150，DEBT-026）
 - 非阻塞：DEBT-023 LLM 结论未纳入评测；DEBT-022 图表 50 点上限、无多序列
 - 非阻塞：DEBT-021 Excel/SQLite 仅单表；DEBT-019 RAG 模板问法；DEBT-016/017 路由与问答简化
